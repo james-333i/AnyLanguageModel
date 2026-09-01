@@ -574,7 +574,6 @@ import Foundation
                 throw LlamaLanguageModelError.encoderOnlyModel
             }
             llama_set_causal_attn(context, true)
-            llama_set_warmup(context, false)
             llama_set_n_threads(context, options.threads, options.threads)
             return context
         }
@@ -618,7 +617,6 @@ import Foundation
                 options: options
             )
             llama_set_causal_attn(context, true)
-            llama_set_warmup(context, false)
             llama_set_n_threads(context, options.threads, options.threads)
 
             do {
