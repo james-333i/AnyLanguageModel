@@ -627,7 +627,7 @@ import Foundation
                 guard shouldUpdateCacheLimit else { return }
                 MLX.Memory.cacheLimit = cacheLimitToSet
                 if shouldClearCache {
-                    GPU.clearCache()
+                    MLX.Memory.clearCache()
                 }
             }
 
