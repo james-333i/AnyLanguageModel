@@ -899,7 +899,7 @@ import Foundation
             let imageMarker = mtmdContext != nil ? String(cString: mtmd_default_marker()) : nil
 
             if type == String.self {
-                let maxTokens = runtimeOptions.maximumResponseTokens ?? 512
+                let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
                 let outputFormat = currentToolCallFormat()
                 var toolContext = try makeToolPromptContext(for: session)
                 let maxToolIterations = 8
@@ -1087,7 +1087,7 @@ import Foundation
                             try await ensureModelLoaded()
 
                             let runtimeOptions = resolvedOptions(from: options)
-                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 512
+                            let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
                             let outputFormat = self.currentToolCallFormat()
                             var toolContext = try self.makeToolPromptContext(for: session)
                             let maxToolIterations = 8
