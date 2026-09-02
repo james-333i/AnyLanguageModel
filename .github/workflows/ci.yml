@@ -36,7 +36,15 @@ jobs:
             swift: "6.2"
             xcode: "26.0"
             traits: "AsyncHTTPClient"
-    timeout-minutes: 10
+          - macos: "26"
+            swift: "6.3"
+            xcode: "26.6"
+            traits: ""
+          - macos: "26"
+            swift: "6.3"
+            xcode: "26.6"
+            traits: "AsyncHTTPClient"
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -78,6 +86,10 @@ jobs:
           - swift: "6.2.4"
             traits: ""
           - swift: "6.2.4"
+            traits: "AsyncHTTPClient"
+          - swift: "6.3.3"
+            traits: ""
+          - swift: "6.3.3"
             traits: "AsyncHTTPClient"
     timeout-minutes: 10
     steps:
