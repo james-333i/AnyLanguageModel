@@ -710,21 +710,6 @@
     // MARK: - Shared FoundationModels Session Bridging
 
     @available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *)
-    func fmTranscriptDroppingDuplicatePrompt(_ transcript: Transcript, prompt: Prompt) -> Transcript {
-        guard let lastEntry = transcript.last, case .prompt(let lastPrompt) = lastEntry else {
-            return transcript
-        }
-        let lastText = lastPrompt.segments.compactMap { segment -> String? in
-            if case .text(let textSegment) = segment { return textSegment.content }
-            return nil
-        }.joined()
-        guard lastText == prompt.description else {
-            return transcript
-        }
-        return Transcript(entries: transcript.dropLast())
-    }
-
-    @available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, visionOS 26.0, *)
     func fmRespond<Content>(
         makeSession: @Sendable () async throws -> FoundationModels.LanguageModelSession,
         fmPrompt: FoundationModels.Prompt,
