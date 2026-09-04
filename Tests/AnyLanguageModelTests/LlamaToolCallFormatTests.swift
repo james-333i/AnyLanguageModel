@@ -195,7 +195,8 @@ import Testing
         }
 
         @Test func gemmaParsesScalarAndNestedArguments() {
-            let text = "<|tool_call>call:f{count:3,enabled:true,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],meta:{k:<|\"|>v<|\"|>}}<tool_call|>"
+            let text =
+                "<|tool_call>call:f{count:3,enabled:true,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],meta:{k:<|\"|>v<|\"|>}}<tool_call|>"
             let (_, calls) = LlamaToolCallFormat.gemma.parseToolCalls(in: text)
             #expect(
                 calls.first?.argumentsJSON

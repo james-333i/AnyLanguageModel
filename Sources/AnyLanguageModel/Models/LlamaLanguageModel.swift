@@ -471,8 +471,17 @@ import Foundation
             var tokens: [llama_token]
             let contextSize: UInt32
             let batchSize: UInt32
+            /// Whether a generation is currently decoding on the context.
+            var isCheckedOut: Bool
+            /// Whether the context should be freed once the current generation releases it.
+            var discardWhenReleased: Bool
         }
 
+        /// Guards `cachedSessionContext`. A generation checks the cached context out
+        /// for its whole run, so a concurrent generation for another session never
+        /// frees a context that is still decoding: it runs on a transient context
+        /// instead and leaves the cache untouched.
+        private let sessionContextLock = NSLock()
         private var cachedSessionContext: CachedSessionContext?
 
         /// The number of prompt tokens reused from the cached context by the most
@@ -484,27 +493,57 @@ import Foundation
 
         /// Frees the cached per-session context and the state it holds.
         ///
-        /// The next chat generation prefills its full prompt again. Call this under
-        /// memory pressure or when a session is discarded.
+        /// The cached context, including its KV state, otherwise lives as long as the
+        /// model. The next chat generation prefills its full prompt again. Call this
+        /// under memory pressure or when a session is discarded. If a generation is
+        /// running on the cached context, it is freed as soon as that generation ends.
         public func clearCachedContext() {
             discardCachedSessionContext()
         }
 
         private func discardCachedSessionContext() {
-            if let cached = cachedSessionContext {
-                llama_free(cached.context)
+            sessionContextLock.lock()
+            defer { sessionContextLock.unlock() }
+            guard var cached = cachedSessionContext else { return }
+            if cached.isCheckedOut {
+                cached.discardWhenReleased = true
+                cachedSessionContext = cached
+                return
             }
+            llama_free(cached.context)
             cachedSessionContext = nil
         }
 
         private func recordCachedTokens(_ tokens: [llama_token], context: OpaquePointer) {
+            sessionContextLock.lock()
+            defer { sessionContextLock.unlock() }
             guard var cached = cachedSessionContext, cached.context == context else { return }
             cached.tokens = tokens
             cachedSessionContext = cached
         }
 
+        /// Returns a context obtained from `acquireSessionContext`. The cached
+        /// context is checked back in (or freed, if a discard was requested while
+        /// it was busy); a transient context is freed.
+        private func releaseSessionContext(_ context: OpaquePointer) {
+            sessionContextLock.lock()
+            defer { sessionContextLock.unlock() }
+            if var cached = cachedSessionContext, cached.context == context {
+                if cached.discardWhenReleased {
+                    llama_free(cached.context)
+                    cachedSessionContext = nil
+                } else {
+                    cached.isCheckedOut = false
+                    cachedSessionContext = cached
+                }
+                return
+            }
+            llama_free(context)
+        }
+
         /// Returns a context for the session along with the index of the first
-        /// prompt token that still needs to be decoded.
+        /// prompt token that still needs to be decoded. Pair every call with
+        /// `releaseSessionContext(_:)` once generation ends.
         ///
         /// A cached context whose recorded tokens share a prefix with the prompt
         /// keeps that prefix: matching state past the divergence point is removed
@@ -512,14 +551,20 @@ import Foundation
         /// (recurrent models) fall back to clearing the memory and decoding the
         /// full prompt. The final prompt token is always re-decoded so sampling
         /// has fresh logits.
+        ///
+        /// While another generation holds the cached context, the caller gets a
+        /// transient context that decodes the full prompt and is not cached.
         private func acquireSessionContext(
             for session: LanguageModelSession,
             promptTokens: [llama_token],
             options: ResolvedGenerationOptions
         ) throws -> (context: OpaquePointer, startIndex: Int) {
             let sessionID = ObjectIdentifier(session)
+            sessionContextLock.lock()
+            defer { sessionContextLock.unlock() }
 
             if var cached = cachedSessionContext,
+                !cached.isCheckedOut,
                 cached.sessionID == sessionID,
                 cached.contextSize == options.contextSize,
                 cached.batchSize == options.batchSize
@@ -541,11 +586,19 @@ import Foundation
                     }
                 }
                 cached.tokens = Array(promptTokens.prefix(common))
+                cached.isCheckedOut = true
                 cachedSessionContext = cached
                 return (cached.context, common)
             }
 
-            discardCachedSessionContext()
+            if let cached = cachedSessionContext, cached.isCheckedOut {
+                return (try makeFreshContext(options: options), 0)
+            }
+
+            if let cached = cachedSessionContext {
+                llama_free(cached.context)
+                cachedSessionContext = nil
+            }
             let contextParams = createContextParams(from: options)
             guard let context = llama_init_from_model(model!, contextParams) else {
                 throw LlamaLanguageModelError.contextInitializationFailed
@@ -559,7 +612,9 @@ import Foundation
                 context: context,
                 tokens: [],
                 contextSize: options.contextSize,
-                batchSize: options.batchSize
+                batchSize: options.batchSize,
+                isCheckedOut: true,
+                discardWhenReleased: false
             )
             return (context, 0)
         }
@@ -617,6 +672,7 @@ import Foundation
                 promptTokens: promptTokens,
                 options: options
             )
+            defer { releaseSessionContext(context) }
             llama_set_causal_attn(context, true)
             llama_set_n_threads(context, options.threads, options.threads)
 
@@ -973,7 +1029,8 @@ import Foundation
                         allEntries.append(.toolCalls(Transcript.ToolCalls(unresolved)))
                         throw Self.maxToolIterationsExceededError(limit: maxToolIterations)
                     }
-                    let signature = parsedCalls
+                    let signature =
+                        parsedCalls
                         .map { "\($0.name):\($0.argumentsJSON)" }
                         .joined(separator: "|")
                     if signature == previousToolCallSignature {
@@ -1187,7 +1244,8 @@ import Foundation
                                     accumulatedEntries.append(.toolCalls(Transcript.ToolCalls(unresolved)))
                                     throw Self.maxToolIterationsExceededError(limit: maxToolIterations)
                                 }
-                                let signature = parsedCalls
+                                let signature =
+                                    parsedCalls
                                     .map { "\($0.name):\($0.argumentsJSON)" }
                                     .joined(separator: "|")
                                 if signature == previousToolCallSignature {
@@ -1200,9 +1258,10 @@ import Foundation
                                 let resolution = try await self.resolveToolCalls(parsedCalls, session: session)
                                 switch resolution {
                                 case .stop(let calls):
+                                    emittedBase += roundVisible
                                     if !calls.isEmpty {
                                         accumulatedEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
-                                        yieldSnapshot(emittedBase + roundVisible)
+                                        yieldSnapshot(emittedBase)
                                     }
                                     break generationLoop
                                 case .invocations(let invocations):
@@ -1279,7 +1338,7 @@ import Foundation
                 var mtmdParams = mtmd_context_params_default()
                 mtmdParams.use_gpu = gpuLayers != 0
                 mtmdParams.print_timings = false
-                mtmdParams.n_threads = Int32(ProcessInfo.processInfo.processorCount)
+                mtmdParams.n_threads = threads
                 guard let projector = mtmd_init_from_file(mmprojPath, loadedModel, mtmdParams) else {
                     llama_model_free(loadedModel)
                     throw LlamaLanguageModelError.modelLoadFailed
@@ -1802,6 +1861,8 @@ import Foundation
                 }
             }
             for imageData in images {
+                // Pinned to the current llama.swift signature. llama.cpp master adds a
+                // trailing options argument to this helper; update alongside the dependency.
                 let wrapper = imageData.withUnsafeBytes { raw -> mtmd_helper_bitmap_wrapper in
                     mtmd_helper_bitmap_init_from_buf(
                         mtmdContext,
@@ -2202,7 +2263,7 @@ import Foundation
 
             guard requiredSize > 0 else {
                 if let tmpl, String(cString: tmpl).contains("<|turn>") {
-                    return renderGemma4Prompt(messages: messages, assistantPrefill: assistantPrefill)
+                    return Self.renderGemma4Prompt(messages: messages, assistantPrefill: assistantPrefill)
                 }
                 throw LlamaLanguageModelError.encodingFailed
             }
@@ -2237,7 +2298,7 @@ import Foundation
         /// `llama_chat_apply_template` does not recognize: turns open with
         /// `<|turn>role`, close with `<turn|>`, and the assistant role is named
         /// `model`. The BOS token is applied during tokenization.
-        private func renderGemma4Prompt(
+        static func renderGemma4Prompt(
             messages: [(role: String, content: String)],
             assistantPrefill: String?
         ) -> String {

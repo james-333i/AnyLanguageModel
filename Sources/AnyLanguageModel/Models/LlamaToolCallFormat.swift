@@ -30,6 +30,10 @@ enum LlamaToolCallFormat: Sendable, Equatable {
     }
 
     /// The marker that ends a complete tool-call block in generated text.
+    ///
+    /// Generation stops at the first terminator, so each round of a tool
+    /// exchange carries exactly one call. Models that want several calls
+    /// issue them across consecutive rounds, each with its own output.
     var callTerminator: String {
         switch self {
         case .hermesJSON, .qwenXML: return "</tool_call>"
@@ -304,7 +308,7 @@ extension LlamaToolCallFormat {
         case let string as String:
             return gemmaQuote(string)
         case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            if isBooleanNumber(number) {
                 return number.boolValue ? "true" : "false"
             }
             if number.doubleValue == number.doubleValue.rounded(),
@@ -347,7 +351,9 @@ extension LlamaToolCallFormat {
         for call in calls {
             switch self {
             case .hermesJSON:
-                parts.append("<tool_call>\n{\"name\": \"\(call.name)\", \"arguments\": \(call.argumentsJSON)}\n</tool_call>")
+                parts.append(
+                    "<tool_call>\n{\"name\": \"\(call.name)\", \"arguments\": \(call.argumentsJSON)}\n</tool_call>"
+                )
             case .qwenXML:
                 var block = "<tool_call>\n<function=\(call.name)>\n"
                 if let data = call.argumentsJSON.data(using: .utf8),
@@ -360,7 +366,9 @@ extension LlamaToolCallFormat {
                 block += "</function>\n</tool_call>"
                 parts.append(block)
             case .gemma:
-                parts.append("<|tool_call>call:\(call.name){\(gemmaArgumentsBody(fromJSON: call.argumentsJSON))}<tool_call|>")
+                parts.append(
+                    "<|tool_call>call:\(call.name){\(gemmaArgumentsBody(fromJSON: call.argumentsJSON))}<tool_call|>"
+                )
             }
         }
         let joined = parts.joined(separator: "\n")
@@ -373,7 +381,7 @@ extension LlamaToolCallFormat {
     private func qwenXMLParameterValue(_ value: Any) -> String {
         if let string = value as? String { return string }
         if let number = value as? NSNumber {
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            if isBooleanNumber(number) {
                 return number.boolValue ? "true" : "false"
             }
             return "\(number)"
@@ -493,7 +501,7 @@ extension LlamaToolCallFormat {
             let key = String(afterParam[..<keyEnd])
             let valueStart = afterParam.index(after: keyEnd)
             guard let paramEnd = afterParam[valueStart...].range(of: "</parameter>") else { break }
-            var value = String(afterParam[valueStart..<paramEnd.lowerBound])
+            var value = String(afterParam[valueStart ..< paramEnd.lowerBound])
             if value.hasPrefix("\n") { value.removeFirst() }
             if value.hasSuffix("\n") { value.removeLast() }
             arguments[key] = qwenXMLDecodedValue(value)
@@ -543,7 +551,7 @@ extension LlamaToolCallFormat {
                 remainder = Substring("")
                 break
             }
-            let body = String(afterStart[bodyStart..<bodyEnd])
+            let body = String(afterStart[bodyStart ..< bodyEnd])
             var rest = afterStart[afterStart.index(after: bodyEnd)...]
             if let terminator = rest.range(of: "<tool_call|>"),
                 rest[..<terminator.lowerBound].allSatisfy({ $0.isWhitespace })
@@ -714,7 +722,7 @@ struct LlamaGemmaArgumentParser {
     private func remainingHasPrefix(_ prefix: String) -> Bool {
         let prefixCharacters = Array(prefix)
         guard index + prefixCharacters.count <= characters.count else { return false }
-        for offset in 0..<prefixCharacters.count
+        for offset in 0 ..< prefixCharacters.count
         where characters[index + offset] != prefixCharacters[offset] {
             return false
         }
@@ -733,4 +741,17 @@ struct LlamaGemmaArgumentParser {
         index += 1
         return true
     }
+}
+
+/// Whether an `NSNumber` produced by JSON decoding holds a boolean.
+///
+/// Core Foundation type identity is the exact check on Darwin. swift-corelibs-foundation
+/// has no `CFBoolean`, so other platforms fall back to the encoded Objective-C type,
+/// which JSON decoding sets to `c` only for booleans.
+func isBooleanNumber(_ number: NSNumber) -> Bool {
+    #if canImport(Darwin)
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+    #else
+        return String(cString: number.objCType) == "c"
+    #endif
 }
