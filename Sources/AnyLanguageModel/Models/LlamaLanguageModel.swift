@@ -1338,7 +1338,7 @@ import Foundation
                 var mtmdParams = mtmd_context_params_default()
                 mtmdParams.use_gpu = gpuLayers != 0
                 mtmdParams.print_timings = false
-                mtmdParams.n_threads = threads
+                mtmdParams.n_threads = legacyDefaults.threads
                 guard let projector = mtmd_init_from_file(mmprojPath, loadedModel, mtmdParams) else {
                     llama_model_free(loadedModel)
                     throw LlamaLanguageModelError.modelLoadFailed
