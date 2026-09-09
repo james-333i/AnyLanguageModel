@@ -514,7 +514,7 @@ import Testing
                 )
             ])
             let session = LanguageModelSession(model: textOnlyModel, transcript: transcript)
-            await #expect(throws: LlamaLanguageModelError.self) {
+            await #expect(throws: LlamaLanguageModelError.unsupportedFeature) {
                 _ = try await session.respond(to: "")
             }
         }

@@ -460,6 +460,15 @@ import Foundation
 
         /// The multimodal projector context, when a projector file was provided
         private var mtmdContext: OpaquePointer?
+        /// `mtmd_helper_eval_chunks` is not thread-safe and every multimodal generation
+        /// shares the one projector context, so bitmap init through eval runs under this lock.
+        private let projectorLock = NSLock()
+
+        private func projectorLocked<T>(_ body: () throws -> T) rethrows -> T {
+            projectorLock.lock()
+            defer { projectorLock.unlock() }
+            return try body()
+        }
 
         /// Whether the model is currently loaded
         private var isModelLoaded: Bool = false
@@ -520,6 +529,12 @@ import Foundation
             guard var cached = cachedSessionContext, cached.context == context else { return }
             cached.tokens = tokens
             cachedSessionContext = cached
+        }
+
+        private func isCachedSessionContext(_ context: OpaquePointer) -> Bool {
+            sessionContextLock.lock()
+            defer { sessionContextLock.unlock() }
+            return cachedSessionContext?.context == context
         }
 
         /// Returns a context obtained from `acquireSessionContext`. The cached
@@ -687,7 +702,9 @@ import Foundation
                     onToken: onToken
                 )
             } catch {
-                discardCachedSessionContext()
+                if isCachedSessionContext(context) {
+                    discardCachedSessionContext()
+                }
                 throw error
             }
         }
@@ -1081,7 +1098,9 @@ import Foundation
                     fullPrompt = try formatPrompt(
                         for: session,
                         extraSystemMessage: schemaPrompt(for: type.generationSchema),
-                        assistantPrefill: runtimeOptions.assistantPrefill
+                        assistantPrefill: runtimeOptions.assistantPrefill,
+                        imageMarker: imageMarker,
+                        images: &promptImages
                     )
                 } else {
                     fullPrompt = try formatPrompt(
@@ -1091,6 +1110,11 @@ import Foundation
                         imageMarker: imageMarker,
                         images: &promptImages
                     )
+                }
+                // Structured output does not go through the projector yet; refuse rather
+                // than answer about an image the model never saw.
+                guard promptImages.isEmpty else {
+                    throw LlamaLanguageModelError.unsupportedFeature
                 }
                 let context = try makeFreshContext(options: runtimeOptions)
                 defer { llama_free(context) }
@@ -1738,8 +1762,10 @@ import Foundation
                 throw LlamaLanguageModelError.modelLoadFailed
             }
 
+            sessionContextLock.lock()
             lastReusedTokenCount = startIndex
             lastPrefillTokenCount = promptTokens.count - startIndex
+            sessionContextLock.unlock()
 
             // Initialize batch
             var batch = llama_batch_init(Int32(options.batchSize), 0, 1)
@@ -1852,68 +1878,70 @@ import Foundation
                 throw LlamaLanguageModelError.contextInitializationFailed
             }
 
-            var bitmaps: [OpaquePointer?] = []
-            defer {
-                for bitmap in bitmaps {
-                    if let bitmap {
-                        mtmd_bitmap_free(bitmap)
+            var pastPosition: llama_pos = 0
+            try projectorLocked {
+                var bitmaps: [OpaquePointer?] = []
+                defer {
+                    for bitmap in bitmaps {
+                        if let bitmap {
+                            mtmd_bitmap_free(bitmap)
+                        }
                     }
                 }
-            }
-            for imageData in images {
-                // Pinned to the current llama.swift signature. llama.cpp master adds a
-                // trailing options argument to this helper; update alongside the dependency.
-                let wrapper = imageData.withUnsafeBytes { raw -> mtmd_helper_bitmap_wrapper in
-                    mtmd_helper_bitmap_init_from_buf(
-                        mtmdContext,
-                        raw.bindMemory(to: UInt8.self).baseAddress,
-                        imageData.count,
-                        false
-                    )
+                for imageData in images {
+                    // Pinned to the current llama.swift signature. llama.cpp master adds a
+                    // trailing options argument to this helper; update alongside the dependency.
+                    let wrapper = imageData.withUnsafeBytes { raw -> mtmd_helper_bitmap_wrapper in
+                        mtmd_helper_bitmap_init_from_buf(
+                            mtmdContext,
+                            raw.bindMemory(to: UInt8.self).baseAddress,
+                            imageData.count,
+                            false
+                        )
+                    }
+                    if let videoContext = wrapper.video_ctx {
+                        mtmd_helper_video_free(videoContext)
+                        throw LlamaLanguageModelError.unsupportedFeature
+                    }
+                    guard let bitmap = wrapper.bitmap else {
+                        throw LlamaLanguageModelError.encodingFailed
+                    }
+                    bitmaps.append(bitmap)
                 }
-                if let videoContext = wrapper.video_ctx {
-                    mtmd_helper_video_free(videoContext)
-                    throw LlamaLanguageModelError.unsupportedFeature
-                }
-                guard let bitmap = wrapper.bitmap else {
+
+                guard let chunks = mtmd_input_chunks_init() else {
                     throw LlamaLanguageModelError.encodingFailed
                 }
-                bitmaps.append(bitmap)
-            }
+                defer { mtmd_input_chunks_free(chunks) }
 
-            guard let chunks = mtmd_input_chunks_init() else {
-                throw LlamaLanguageModelError.encodingFailed
-            }
-            defer { mtmd_input_chunks_free(chunks) }
-
-            let tokenizeResult = prompt.withCString { cPrompt -> Int32 in
-                var inputText = mtmd_input_text(
-                    text: cPrompt,
-                    text_len: strlen(cPrompt),
-                    add_special: true,
-                    parse_special: true
-                )
-                return bitmaps.withUnsafeMutableBufferPointer { buffer in
-                    mtmd_tokenize(mtmdContext, chunks, &inputText, buffer.baseAddress, buffer.count)
+                let tokenizeResult = prompt.withCString { cPrompt -> Int32 in
+                    var inputText = mtmd_input_text(
+                        text: cPrompt,
+                        text_len: strlen(cPrompt),
+                        add_special: true,
+                        parse_special: true
+                    )
+                    return bitmaps.withUnsafeMutableBufferPointer { buffer in
+                        mtmd_tokenize(mtmdContext, chunks, &inputText, buffer.baseAddress, buffer.count)
+                    }
                 }
-            }
-            guard tokenizeResult == 0 else {
-                throw LlamaLanguageModelError.tokenizationFailed
-            }
+                guard tokenizeResult == 0 else {
+                    throw LlamaLanguageModelError.tokenizationFailed
+                }
 
-            var pastPosition: llama_pos = 0
-            let evalResult = mtmd_helper_eval_chunks(
-                mtmdContext,
-                context,
-                chunks,
-                0,
-                0,
-                Int32(options.batchSize),
-                true,
-                &pastPosition
-            )
-            guard evalResult == 0 else {
-                throw LlamaLanguageModelError.decodingFailed
+                let evalResult = mtmd_helper_eval_chunks(
+                    mtmdContext,
+                    context,
+                    chunks,
+                    0,
+                    0,
+                    Int32(options.batchSize),
+                    true,
+                    &pastPosition
+                )
+                guard evalResult == 0 else {
+                    throw LlamaLanguageModelError.decodingFailed
+                }
             }
 
             guard let sampler = llama_sampler_chain_init(llama_sampler_chain_default_params()) else {
