@@ -470,7 +470,11 @@ import Foundation
             return try body()
         }
 
-        /// Whether the model is currently loaded
+        /// Serializes the loaded-state check, loading, and publication of the model,
+        /// vocabulary, and projector so concurrent first requests cannot reload them.
+        private let modelLoadLock = NSLock()
+
+        /// Whether the model is currently loaded. Protected by `modelLoadLock`.
         private var isModelLoaded: Bool = false
 
         /// A context kept alive for one session so exchanges reuse its state.
@@ -786,7 +790,21 @@ import Foundation
         struct LlamaToolPromptContext {
             let format: LlamaToolCallFormat
             let definitions: [LlamaToolDefinition]
-            var pendingEntries: [Transcript.Entry]
+            var pendingEntries: [Transcript.Entry] = []
+
+            init(format: LlamaToolCallFormat, tools: [any Tool]) throws {
+                self.format = format
+                self.definitions = try tools.filter(\.includesSchemaInInstructions).map { tool in
+                    let schema = tool.parameters.withResolvedRoot() ?? tool.parameters
+                    let data = try JSONEncoder().encode(schema)
+                    let parameters = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    return LlamaToolDefinition(
+                        name: tool.name,
+                        description: tool.description,
+                        parameters: parameters
+                    )
+                }
+            }
         }
 
         private struct ToolInvocationResult {
@@ -825,18 +843,7 @@ import Foundation
 
         private func makeToolPromptContext(for session: LanguageModelSession) throws -> LlamaToolPromptContext? {
             guard !session.tools.isEmpty, self.model != nil else { return nil }
-            let format = currentToolCallFormat()
-            let definitions = try session.tools.map { tool -> LlamaToolDefinition in
-                let schema = tool.parameters.withResolvedRoot() ?? tool.parameters
-                let data = try JSONEncoder().encode(schema)
-                let parameters = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                return LlamaToolDefinition(
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: parameters
-                )
-            }
-            return LlamaToolPromptContext(format: format, definitions: definitions, pendingEntries: [])
+            return try LlamaToolPromptContext(format: currentToolCallFormat(), tools: session.tools)
         }
 
         private func toolOutputText(_ output: Transcript.ToolOutput) -> String {
@@ -963,7 +970,7 @@ import Foundation
             if mmprojPath == nil {
                 try validateNoImageSegments(in: session)
             }
-            try await ensureModelLoaded()
+            try ensureModelLoaded()
 
             let runtimeOptions = resolvedOptions(from: options)
             let structuredOptions = resolvedStructuredOptions(from: options)
@@ -1035,8 +1042,10 @@ import Foundation
                         break generationLoop
                     }
                     let (visibleText, parsedCalls) = format.parseToolCalls(in: accumulated)
+                    // Keep the text from every round, as the streaming path does,
+                    // so a preamble before a tool call is not lost.
+                    text += visibleText
                     if parsedCalls.isEmpty {
-                        text = visibleText
                         break generationLoop
                     }
 
@@ -1070,7 +1079,6 @@ import Foundation
                         )
                     case .invocations(let invocations):
                         guard !invocations.isEmpty else {
-                            text = visibleText
                             break generationLoop
                         }
                         let callsEntry = Transcript.Entry.toolCalls(
@@ -1164,7 +1172,7 @@ import Foundation
                 AsyncThrowingStream { continuation in
                     let task = Task {
                         do {
-                            try await ensureModelLoaded()
+                            try ensureModelLoaded()
 
                             let runtimeOptions = resolvedOptions(from: options)
                             let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
@@ -1249,7 +1257,8 @@ import Foundation
 
                                 let roundVisible = outputFormat.streamingVisibleText(
                                     in: roundRaw,
-                                    withholdToolCalls: withholdToolCalls
+                                    withholdToolCalls: withholdToolCalls,
+                                    holdPartialMarkers: false
                                 )
 
                                 guard let format = toolContext?.format else {
@@ -1327,7 +1336,10 @@ import Foundation
 
         // MARK: - Private Helpers
 
-        private func ensureModelLoaded() async throws {
+        private func ensureModelLoaded() throws {
+            modelLoadLock.lock()
+            defer { modelLoadLock.unlock() }
+
             guard !isModelLoaded else { return }
 
             // Check if model file exists
@@ -1900,6 +1912,9 @@ import Foundation
                         )
                     }
                     if let videoContext = wrapper.video_ctx {
+                        if let bitmap = wrapper.bitmap {
+                            mtmd_bitmap_free(bitmap)
+                        }
                         mtmd_helper_video_free(videoContext)
                         throw LlamaLanguageModelError.unsupportedFeature
                     }
