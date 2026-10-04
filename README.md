@@ -10,6 +10,11 @@ All you need to do is change your import statement:
 + import AnyLanguageModel
 ```
 
+Anything AnyLanguageModel adds beyond Apple's API
+is marked as an extension in its documentation.
+[Differences from Foundation Models](#differences-from-foundation-models)
+summarizes these extensions.
+
 ```swift
 struct WeatherTool: Tool {
     let name = "getWeather"
@@ -83,15 +88,8 @@ session.toolExecutionDelegate = ToolExecutionObserver()
 
 ## Requirements
 
-- Swift 6.1+
+- Swift 6.3+ (Xcode 26.4+)
 - iOS 17.0+ / macOS 14.0+ / visionOS 1.0+ / Linux
-
-> [!IMPORTANT]
-> A bug in Xcode 26 may cause build errors
-> when targeting macOS 15 / iOS 18 or earlier
-> (e.g. `Conformance of 'String' to 'Generable' is only available in macOS 26.0 or newer`).
-> As a workaround, build your project with Xcode 16.
-> For more information, see [issue #15](https://github.com/huggingface/AnyLanguageModel/issues/15).
 
 ## Installation
 
@@ -99,7 +97,7 @@ Add this package to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/huggingface/AnyLanguageModel", from: "0.12.0")
+    .package(url: "https://github.com/huggingface/AnyLanguageModel", from: "0.16.0")
 ]
 ```
 
@@ -127,7 +125,7 @@ To enable specific traits, specify them in your package's dependencies:
 dependencies: [
     .package(
         url: "https://github.com/huggingface/AnyLanguageModel.git",
-        from: "0.12.0",
+        from: "0.16.0",
         traits: ["CoreML", "MLX"] // Enable CoreML and MLX support
     )
 ]
@@ -144,7 +142,7 @@ dependencies: [
 > dependencies: [
 >     .package(
 >         url: "https://github.com/huggingface/AnyLanguageModel.git",
->         from: "0.12.0",
+>         from: "0.16.0",
 >         traits: ["CoreML", "MLX", "Llama"]
 >     ),
 >     .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"), // CoreML
@@ -380,6 +378,10 @@ use a vision-capable model
 For llama.cpp,
 pass the model's multimodal projector with `mmprojPath:`.
 
+> [!NOTE]
+> Image inputs are an AnyLanguageModel extension.
+> See [Differences from Foundation Models](#differences-from-foundation-models).
+
 ### Tool Calling
 
 Tool calling is supported by all providers.
@@ -438,6 +440,95 @@ actor ToolExecutionObserver: ToolExecutionDelegate {
 
 session.toolExecutionDelegate = ToolExecutionObserver()
 ```
+
+> [!NOTE]
+> Tool execution delegates are an AnyLanguageModel extension.
+> See [Differences from Foundation Models](#differences-from-foundation-models).
+
+### Dynamic Instructions
+
+`DynamicInstructions` lets a session change the instructions and tools
+for each request to the model,
+without creating a new session:
+
+```swift
+final class CurrentAppState {
+    var canCheckWeather = false
+}
+
+struct CurrentAppInstructions: DynamicInstructions {
+    let state: CurrentAppState
+
+    var body: some DynamicInstructions {
+        Instructions("Help with the currently visible app.")
+        if state.canCheckWeather {
+            WeatherTool()
+        }
+    }
+}
+
+let state = CurrentAppState()
+let session = LanguageModelSession(
+    model: model,
+    dynamicInstructions: CurrentAppInstructions(state: state),
+    history: savedHistory
+)
+```
+
+The session evaluates the body before every request to the model,
+including the request that continues a response after tool calls.
+The resolved instructions are sent with each request
+but never become part of the session's transcript.
+
+> [!NOTE]
+> Dynamic instructions follow the Foundation Models 27 API.
+> `SystemLanguageModel` supports them only in apps built with Swift 6.4 or later
+> that run on OS 27 or later, and not on tvOS.
+> Otherwise, it throws `SystemLanguageModel.Error.dynamicInstructionsUnavailable`
+> for a session with dynamic instructions.
+
+### Reasoning in the transcript
+
+Reasoning is transcript content, separate from the answer in `response.content`.
+A provider can emit `Transcript.Entry.reasoning` through the existing cumulative
+`transcriptEntries` on responses and streaming snapshots. Each `Transcript.Reasoning`
+contains a stable `id`, display `segments`, opaque `signature: Data?`, and metadata.
+Treat successive snapshots as updates to the same entries, not new history rows.
+
+The built-in Anthropic provider populates these entries for thinking and redacted
+thinking, in streaming and nonstreaming responses, including tool rounds:
+
+```swift
+let model = AnthropicLanguageModel(apiKey: apiKey, model: modelID)
+let session = LanguageModelSession(model: model)
+var options = GenerationOptions(maximumResponseTokens: 4096)
+options[custom: AnthropicLanguageModel.self] = .init(thinking: .init(budgetTokens: 1024))
+for try await snapshot in session.streamResponse(to: "Explain your approach", options: options) {
+    let reasoning = snapshot.transcriptEntries.compactMap { entry -> String? in
+        guard case .reasoning(let value) = entry else { return nil }
+        return value.segments.compactMap { segment -> String? in
+            guard case .text(let text) = segment else { return nil }
+            return text.content
+        }.joined()
+    }.joined()
+    // Replace the displayed reasoning and answer independently.
+    print(reasoning)
+    print(snapshot.content)
+}
+let savedTranscript = try JSONEncoder().encode(session.transcript)
+```
+
+Choose an Anthropic model and thinking budget that support this configuration.
+Redacted thinking has no display segments. Signatures and metadata are opaque
+replay state; preserve them with the transcript, and do not display them as text.
+The Anthropic adapter can replay its own reasoning entries after Codable restoration.
+When switching providers, adapters that cannot replay reasoning omit those entries
+from their requests; Anthropic likewise skips reasoning from other providers.
+The original reasoning remains in the transcript for display and persistence.
+Anthropic still validates its own replay signatures. CoreML keeps its existing
+prompt-only behavior and does not send transcript history. For structured scalar outputs that
+cannot represent an absent partial value, reasoning updates wait until a valid
+partial answer is available. Cancellation behavior is unchanged.
 
 ### Token Usage
 
@@ -498,6 +589,67 @@ the latest value is kept for each metadata key.
 > and follows the documented
 > [Foundation Models 27 usage API](https://developer.apple.com/documentation/foundationmodels/languagemodelsession/usage-swift.struct).
 > `Codable` and `Equatable` support are AnyLanguageModel extensions.
+
+## Differences from Foundation Models
+
+Code that uses an extension doesn't compile with Foundation Models on OS 26.
+Each extension's documentation comment says so,
+and extensions that follow a Foundation Models 27 API,
+such as token usage,
+say which API they follow.
+
+### Extensions
+
+- `LanguageModel` and `Availability`:
+  the protocol that lets a session use any model provider.
+  Foundation Models 27 adds its own `LanguageModel` protocol
+  with different requirements.
+  Session initializers require a `model:` argument
+  instead of defaulting to `SystemLanguageModel.default`.
+- `GenerationOptions[custom:]` and `CustomGenerationOptions`:
+  options for one provider,
+  described in that provider's section under [Providers](#providers).
+- `respond(to:images:)`, `Transcript.ImageSegment`, and `Transcript.Segment.image`:
+  [image inputs](#image-inputs).
+  Foundation Models 27 adds prompt attachments,
+  and AnyLanguageModel 2.0 will change to match them.
+- `ToolExecutionDelegate`, `ToolExecutionDecision`, and `toolExecutionDelegate`:
+  [observing and controlling tool calls](#tool-calling).
+- `transcriptErrorHandlingPolicy` and `waitForResponseCompletion()`:
+  what a transcript keeps when a request fails or is cancelled.
+- `LanguageModelSession.tools`, `instructions`, and `resolvedRequestContext()`:
+  the session's tools, instructions, and the inputs for each request,
+  for language models defined outside AnyLanguageModel.
+- `Usage` and the `usage` properties:
+  [token usage](#token-usage),
+  which follows the Foundation Models 27 API.
+- `DynamicInstructions`, its builder, and `LanguageModelSession.init(model:dynamicInstructions:history:)`:
+  [dynamic instructions](#dynamic-instructions),
+  which follow the Foundation Models 27 API.
+- `Transcript.Entry.reasoning` and `Transcript.Reasoning`:
+  [reasoning in the transcript](#reasoning-in-the-transcript),
+  which follows the Foundation Models 27 API.
+- Public initializers for `Response`, `ResponseStream`, `ResponseStream.Snapshot`,
+  `GenerationGuide`, and `LanguageModelFeedback`,
+  for language models defined outside AnyLanguageModel.
+- `Codable` conformance for `GeneratedContent`, `GenerationID`, `Usage`,
+  and the types nested in `Transcript`.
+- `GeneratedContentError`, `Transcript.ReasoningReplayError`, `SystemLanguageModel.Error`,
+  and each provider's error type.
+- `JSONValue`:
+  JSON values for provider options such as `extraBody`.
+- Smaller additions to existing types,
+  such as `LanguageModel.isAvailable`, `SystemLanguageModel.supportsImageInput`,
+  `Transcript.ToolCall.providerMetadata`, and `GenerationError.Refusal.transcriptEntries`.
+
+### Behavior differences
+
+- A session adds the prompt to its transcript before the model responds,
+  as a single text segment.
+- A structured response is recorded in the transcript as JSON text,
+  not as a structured segment.
+- A session created from a transcript restores `instructions`
+  only when the first entry is instructions with a single text segment.
 
 ## Providers
 
@@ -593,7 +745,7 @@ Enable the trait in Package.swift:
 ```swift
 .package(
     url: "https://github.com/huggingface/AnyLanguageModel.git",
-    from: "0.12.0",
+    from: "0.16.0",
     traits: ["CoreML"]
 )
 ```
@@ -604,7 +756,7 @@ Runs [MLX](https://github.com/ml-explore/mlx-swift) models on Apple Silicon
 (requires `MLX` trait):
 
 ```swift
-let model = MLXLanguageModel(modelId: "mlx-community/Qwen3-0.6B-4bit")
+let model = MLXLanguageModel(modelId: "mlx-community/Qwen3.5-4B-MLX-4bit")
 
 let session = LanguageModelSession(model: model)
 let response = try await session.respond {
@@ -664,7 +816,7 @@ GPU cache behavior can be configured when creating the model:
 
 ```swift
 let model = MLXLanguageModel(
-    modelId: "mlx-community/Qwen3-0.6B-4bit",
+    modelId: "mlx-community/Qwen3.5-4B-MLX-4bit",
     gpuMemory: .automatic
 )
 ```
@@ -690,7 +842,7 @@ Enable the trait in Package.swift:
 ```swift
 .package(
     url: "https://github.com/huggingface/AnyLanguageModel.git",
-    from: "0.12.0",
+    from: "0.16.0",
     traits: ["MLX"]
 )
 ```
@@ -714,7 +866,7 @@ Enable the trait in Package.swift:
 ```swift
 .package(
     url: "https://github.com/huggingface/AnyLanguageModel.git",
-    from: "0.12.0",
+    from: "0.16.0",
     traits: ["Llama"]
 )
 ```
@@ -763,12 +915,12 @@ Run models locally via Ollama's
 
 ```swift
 // Default: connects to http://localhost:11434
-let model = OllamaLanguageModel(model: "qwen3") // `ollama pull qwen3:8b`
+let model = OllamaLanguageModel(model: "qwen3.5") // `ollama pull qwen3.5:9b`
 
 // Custom endpoint
 let model = OllamaLanguageModel(
     endpoint: URL(string: "http://remote-server:11434")!,
-    model: "llama3.2"
+    model: "gemma4"
 )
 
 let session = LanguageModelSession(model: model)
@@ -782,7 +934,7 @@ For local models, make sure you're using a vision‑capable model
 You can combine multiple images:
 
 ```swift
-let model = OllamaLanguageModel(model: "qwen3-vl") // `ollama pull qwen3-vl:8b`
+let model = OllamaLanguageModel(model: "qwen3.5") // `ollama pull qwen3.5:9b`
 let session = LanguageModelSession(model: model)
 let response = try await session.respond(
     to: "Compare these posters and summarize their differences",
@@ -815,7 +967,7 @@ Supports both
 ```swift
 let model = OpenAILanguageModel(
     apiKey: ProcessInfo.processInfo.environment["OPENAI_API_KEY"]!,
-    model: "gpt-4o-mini"
+    model: "gpt-5.6-luna"
 )
 
 let session = LanguageModelSession(model: model)
@@ -838,13 +990,13 @@ For OpenAI-compatible endpoints that use older Chat Completions API:
 let model = OpenAILanguageModel(
     baseURL: URL(string: "https://api.example.com")!,
     apiKey: apiKey,
-    model: "gpt-4o-mini",
+    model: "gpt-5.6-luna",
     apiVariant: .chatCompletions
 )
 ```
 
 Use custom generation options for advanced parameters like sampling controls,
-reasoning effort (for o-series models), and vendor-specific extensions:
+reasoning effort (for GPT-5.6 and GPT-6 models), and vendor-specific extensions:
 
 ```swift
 var options = GenerationOptions(temperature: 0.8)
@@ -853,7 +1005,7 @@ options[custom: OpenAILanguageModel.self] = .init(
     frequencyPenalty: 0.5,
     presencePenalty: 0.3,
     stopSequences: ["END"],
-    reasoningEffort: .high,        // For reasoning models (o3, o4-mini)
+    reasoningEffort: .high,        // For reasoning models (gpt-5.6, gpt-6-astra)
     serviceTier: .priority,
     extraBody: [                   // Vendor-specific parameters
         "custom_param": .string("value")
@@ -873,14 +1025,14 @@ Base URL is required—use your provider’s endpoint:
 let model = OpenResponsesLanguageModel(
     baseURL: URL(string: "https://openrouter.ai/api/v1/")!,
     apiKey: ProcessInfo.processInfo.environment["OPEN_RESPONSES_API_KEY"]!,
-    model: "openai/gpt-4o-mini"
+    model: "openai/gpt-5.6"
 )
 
 // Example: OpenAI
 let model = OpenResponsesLanguageModel(
     baseURL: URL(string: "https://api.openai.com/v1/")!,
     apiKey: ProcessInfo.processInfo.environment["OPEN_RESPONSES_API_KEY"]!,
-    model: "gpt-4o-mini"
+    model: "gpt-5.6-luna"
 )
 
 let session = LanguageModelSession(model: model)
@@ -907,7 +1059,7 @@ Uses the [Messages API](https://docs.claude.com/en/api/messages) with Claude mod
 ```swift
 let model = AnthropicLanguageModel(
     apiKey: ProcessInfo.processInfo.environment["ANTHROPIC_API_KEY"]!,
-    model: "claude-sonnet-4-5-20250929"
+    model: "claude-sonnet-5"
 )
 
 let session = LanguageModelSession(model: model, tools: [WeatherTool()])
@@ -966,7 +1118,7 @@ Uses the [Gemini API](https://ai.google.dev/api/generate-content) with Gemini mo
 ```swift
 let model = GeminiLanguageModel(
     apiKey: ProcessInfo.processInfo.environment["GEMINI_API_KEY"]!,
-    model: "gemini-2.5-flash"
+    model: "gemini-3.8-flash"
 )
 
 let session = LanguageModelSession(model: model, tools: [WeatherTool()])

@@ -38,6 +38,9 @@ public struct OpenAILanguageModel: LanguageModel {
 
     /// Custom generation options specific to OpenAI-compatible APIs.
     ///
+    /// Reached through `GenerationOptions[custom: OpenAILanguageModel.self]`,
+    /// an AnyLanguageModel extension.
+    ///
     /// Use this type to pass additional parameters that are not part of the
     /// standard ``GenerationOptions``, such as sampling parameters, penalties,
     /// and vendor-specific extensions.
@@ -465,22 +468,9 @@ public struct OpenAILanguageModel: LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
-        // Convert tools if any are available in the session
-        let openAITools: [OpenAITool]? = {
-            guard !session.tools.isEmpty else { return nil }
-            var converted: [OpenAITool] = []
-            converted.reserveCapacity(session.tools.count)
-            for tool in session.tools {
-                converted.append(convertToolToOpenAIFormat(tool))
-            }
-            return converted
-        }()
-
         switch apiVariant {
         case .chatCompletions:
             return try await respondWithChatCompletions(
-                messages: session.transcript.toOpenAIMessages(),
-                tools: openAITools,
                 generating: type,
                 schema: schema,
                 options: options,
@@ -488,8 +478,6 @@ public struct OpenAILanguageModel: LanguageModel {
             )
         case .responses:
             return try await respondWithResponses(
-                messages: session.transcript.toOpenAIMessages(),
-                tools: openAITools,
                 generating: type,
                 schema: schema,
                 options: options,
@@ -499,8 +487,6 @@ public struct OpenAILanguageModel: LanguageModel {
     }
 
     private func respondWithChatCompletions<Content>(
-        messages: [OpenAIMessage],
-        tools: [OpenAITool]?,
         generating type: Content.Type,
         schema: GenerationSchema,
         options: GenerationOptions,
@@ -510,10 +496,18 @@ public struct OpenAILanguageModel: LanguageModel {
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
         var text = ""
-        var messages = messages
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
+        var inFlightMessages: [OpenAIMessage] = []
 
+        var toolRounds = ToolRoundLimit(provider: "OpenAI")
         // Loop until no more tool calls
         while true {
+            let requestContext = session.resolvedRequestContext()
+            let tools =
+                requestContext.tools.isEmpty
+                ? nil : requestContext.tools.map(convertToolToOpenAIFormat)
+            let messages = requestContext.transcript.toOpenAIMessages() + inFlightMessages
             let params = try ChatCompletions.createRequestBody(
                 model: model,
                 messages: messages,
@@ -556,9 +550,14 @@ public struct OpenAILanguageModel: LanguageModel {
             let toolCallMessage = choice.message
             if let toolCalls = toolCallMessage.toolCalls, !toolCalls.isEmpty {
                 if let value = try? JSONValue(toolCallMessage) {
-                    messages.append(OpenAIMessage(role: .raw(rawContent: value), content: .text("")))
+                    inFlightMessages.append(OpenAIMessage(role: .raw(rawContent: value), content: .text("")))
                 }
-                let resolution = try await resolveToolCalls(toolCalls, session: session)
+                try toolRounds.record(toolCalls.map(\.roundCall))
+                let resolution = try await resolveToolCalls(
+                    toolCalls,
+                    tools: requestContext.tools,
+                    session: session
+                )
                 switch resolution {
                 case .stop(let calls):
                     if !calls.isEmpty {
@@ -577,19 +576,20 @@ public struct OpenAILanguageModel: LanguageModel {
                         for invocation in invocations {
                             let output = invocation.output
                             entries.append(.toolOutput(output))
-                            messages.append(
+                            inFlightMessages.append(
                                 OpenAIMessage(
                                     role: .tool(id: invocation.call.id),
                                     content: .text(convertSegmentsToToolContentString(output.segments))
                                 )
                             )
                         }
+                        if type == String.self { earlierText += toolCallMessage.content ?? "" }
                         continue
                     }
                 }
             }
 
-            text = choice.message.content ?? ""
+            text = earlierText + (choice.message.content ?? "")
             break
         }
 
@@ -613,8 +613,6 @@ public struct OpenAILanguageModel: LanguageModel {
     }
 
     private func respondWithResponses<Content>(
-        messages: [OpenAIMessage],
-        tools: [OpenAITool]?,
         generating type: Content.Type,
         schema: GenerationSchema,
         options: GenerationOptions,
@@ -623,13 +621,21 @@ public struct OpenAILanguageModel: LanguageModel {
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
         var text = ""
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
         var lastOutput: [JSONValue]?
-        var messages = messages
+        var inFlightMessages: [OpenAIMessage] = []
 
         let url = baseURL.appendingPathComponent("responses")
 
+        var toolRounds = ToolRoundLimit(provider: "OpenAI")
         // Loop until no more tool calls
         while true {
+            let requestContext = session.resolvedRequestContext()
+            let tools =
+                requestContext.tools.isEmpty
+                ? nil : requestContext.tools.map(convertToolToOpenAIFormat)
+            let messages = requestContext.transcript.toOpenAIMessages() + inFlightMessages
             let params = try Responses.createRequestBody(
                 model: model,
                 messages: messages,
@@ -658,10 +664,15 @@ public struct OpenAILanguageModel: LanguageModel {
             if !toolCalls.isEmpty {
                 if let output = resp.output {
                     for msg in output {
-                        messages.append(OpenAIMessage(role: .raw(rawContent: msg), content: .text("")))
+                        inFlightMessages.append(OpenAIMessage(role: .raw(rawContent: msg), content: .text("")))
                     }
                 }
-                let resolution = try await resolveToolCalls(toolCalls, session: session)
+                try toolRounds.record(toolCalls.map(\.roundCall))
+                let resolution = try await resolveToolCalls(
+                    toolCalls,
+                    tools: requestContext.tools,
+                    session: session
+                )
                 switch resolution {
                 case .stop(let calls):
                     if !calls.isEmpty {
@@ -681,19 +692,22 @@ public struct OpenAILanguageModel: LanguageModel {
                         for invocation in invocations {
                             let output = invocation.output
                             entries.append(.toolOutput(output))
-                            messages.append(
+                            inFlightMessages.append(
                                 OpenAIMessage(
                                     role: .tool(id: invocation.call.id),
                                     content: .text(convertSegmentsToToolContentString(output.segments))
                                 )
                             )
                         }
+                        if type == String.self {
+                            earlierText += resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+                        }
                         continue
                     }
                 }
             }
 
-            text = resp.outputText ?? extractTextFromOutput(resp.output) ?? ""
+            text = earlierText + (resp.outputText ?? extractTextFromOutput(resp.output) ?? "")
 
             break
         }
@@ -762,157 +776,155 @@ public struct OpenAILanguageModel: LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
-        // Convert tools if any are available in the session
-        let openAITools: [OpenAITool]? = {
-            guard !session.tools.isEmpty else { return nil }
-            var converted: [OpenAITool] = []
-            converted.reserveCapacity(session.tools.count)
-            for tool in session.tools {
-                converted.append(convertToolToOpenAIFormat(tool))
-            }
-            return converted
-        }()
-
-        switch apiVariant {
-        case .responses:
-            let url = baseURL.appendingPathComponent("responses")
-
-            let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
-                continuation in
+        let stream = AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> {
+            continuation in
+            let task = Task {
                 do {
-                    let params = try Responses.createRequestBody(
-                        model: model,
-                        messages: session.transcript.toOpenAIMessages(),
-                        tools: openAITools,
-                        generating: type,
-                        schema: schema,
-                        options: options,
-                        stream: true
-                    )
-                    let task = Task { @Sendable in
-                        do {
-                            let body = try JSONEncoder().encode(params)
+                    var inFlightMessages: [OpenAIMessage] = []
+                    var state = StreamingResponseState<Content>()
+                    var toolRounds = ToolRoundLimit(provider: "OpenAI")
+                    while true {
+                        try Task.checkCancellation()
+                        let requestContext = session.resolvedRequestContext()
+                        let tools =
+                            requestContext.tools.isEmpty
+                            ? nil : requestContext.tools.map(convertToolToOpenAIFormat)
+                        let messages = requestContext.transcript.toOpenAIMessages() + inFlightMessages
+                        let params: JSONValue
+                        let path: String
+                        switch apiVariant {
+                        case .responses:
+                            path = "responses"
+                            params = try Responses.createRequestBody(
+                                model: model,
+                                messages: messages,
+                                tools: tools,
+                                generating: type,
+                                schema: schema,
+                                options: options,
+                                stream: true
+                            )
+                        case .chatCompletions:
+                            path = "chat/completions"
+                            params = try ChatCompletions.createRequestBody(
+                                model: model,
+                                messages: messages,
+                                tools: tools,
+                                generating: type,
+                                schema: schema,
+                                options: options,
+                                stream: true,
+                                includeUsage: baseURL.host == Self.defaultBaseURL.host
+                            )
+                        }
+                        let body = try JSONEncoder().encode(params)
+                        let url = baseURL.appendingPathComponent(path)
+                        let headers = ["Authorization": "Bearer \(tokenProvider())"]
+                        var toolCalls: [OpenAIToolCall] = []
 
+                        switch apiVariant {
+                        case .responses:
                             let events: AsyncThrowingStream<OpenAIResponsesServerEvent, any Error> =
-                                httpSession.fetchEventStream(
-                                    .post,
-                                    url: url,
-                                    headers: [
-                                        "Authorization": "Bearer \(tokenProvider())"
-                                    ],
-                                    body: body
-                                )
-
-                            var accumulatedText = ""
-                            var usage = ReportedUsage()
-
-                            for try await event in events {
+                                httpSession.fetchEventStream(.post, url: url, headers: headers, body: body)
+                            responseEvents: for try await event in events {
                                 switch event {
                                 case .outputTextDelta(let delta):
-                                    accumulatedText += delta
-
-                                    if let snapshot = LanguageModelSession.ResponseStream<Content>.Snapshot(
-                                        text: accumulatedText,
-                                        usage: usage.value
-                                    ) {
-                                        continuation.yield(snapshot)
+                                    state.text += delta
+                                    if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                                case .completed(let response):
+                                    state.usage.merge(response?.usage?.reportedUsage)
+                                    // The completed response contains full tool arguments and
+                                    // the output items required by the next request.
+                                    toolCalls = extractToolCallsFromOutput(response?.output)
+                                    if !toolCalls.isEmpty, let output = response?.output {
+                                        for item in output {
+                                            inFlightMessages.append(
+                                                .init(role: .raw(rawContent: item), content: .text(""))
+                                            )
+                                        }
                                     }
-                                case .toolCallCreated(_):
-                                    // Minimal streaming implementation ignores tool call events
-                                    break
-                                case .toolCallDelta(_):
-                                    // Minimal streaming implementation ignores tool call deltas
-                                    break
-                                case .completed(let responseUsage):
-                                    usage.merge(responseUsage?.reportedUsage)
-                                    if let snapshot = LanguageModelSession.ResponseStream<Content>.Snapshot(
-                                        text: accumulatedText,
-                                        usage: usage.value
-                                    ) {
-                                        continuation.yield(snapshot)
-                                    }
-                                    continuation.finish()
+                                    if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                                    break responseEvents
+                                case .failed(let failure):
+                                    throw OpenAILanguageModelError.streamFailed(
+                                        code: failure?.code,
+                                        message: failure?.message
+                                    )
                                 case .ignored:
                                     break
                                 }
                             }
-
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
-                        }
-                    }
-                    continuation.onTermination = { _ in task.cancel() }
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-
-            return LanguageModelSession.ResponseStream(stream: stream)
-
-        case .chatCompletions:
-            let url = baseURL.appendingPathComponent("chat/completions")
-
-            let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
-                continuation in
-                do {
-                    let params = try ChatCompletions.createRequestBody(
-                        model: model,
-                        messages: session.transcript.toOpenAIMessages(),
-                        tools: openAITools,
-                        generating: type,
-                        schema: schema,
-                        options: options,
-                        stream: true,
-                        includeUsage: baseURL.host == Self.defaultBaseURL.host
-                    )
-
-                    let task = Task { @Sendable in
-                        do {
-                            let body = try JSONEncoder().encode(params)
-
+                        case .chatCompletions:
                             let events: AsyncThrowingStream<OpenAIChatCompletionsChunk, any Error> =
-                                httpSession.fetchEventStream(
-                                    .post,
-                                    url: url,
-                                    headers: [
-                                        "Authorization": "Bearer \(tokenProvider())"
-                                    ],
-                                    body: body
-                                )
-
-                            var accumulatedText = ""
-                            var usage = ReportedUsage()
-
+                                httpSession.fetchEventStream(.post, url: url, headers: headers, body: body)
+                            var calls: [Int: OpenAIStreamedToolCall] = [:]
                             for try await chunk in events {
-                                usage.merge(chunk.usage?.reportedUsage)
-                                let piece = chunk.choices.first?.delta.content
-                                if let piece { accumulatedText += piece }
-                                // A usage-only chunk follows the finish reason
-                                // when include_usage is enabled.
-                                if piece?.isEmpty == false || chunk.usage?.reportedUsage != nil {
-                                    if let snapshot = LanguageModelSession.ResponseStream<Content>.Snapshot(
-                                        text: accumulatedText,
-                                        usage: usage.value
-                                    ) {
-                                        continuation.yield(snapshot)
-                                    }
+                                state.usage.merge(chunk.usage?.reportedUsage)
+                                let delta = chunk.choices.first?.delta
+                                if let piece = delta?.content { state.text += piece }
+                                for delta in delta?.toolCalls ?? [] {
+                                    var call = calls[delta.index] ?? OpenAIStreamedToolCall()
+                                    if let id = delta.id { call.id = id }
+                                    if let name = delta.function?.name { call.name += name }
+                                    if let arguments = delta.function?.arguments { call.arguments += arguments }
+                                    calls[delta.index] = call
+                                }
+                                if delta?.content?.isEmpty == false || chunk.usage?.reportedUsage != nil {
+                                    if let snapshot = state.snapshot() { continuation.yield(snapshot) }
                                 }
                             }
-
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
+                            toolCalls = calls.keys.sorted().compactMap { calls[$0]?.toolCall }
+                            if !toolCalls.isEmpty {
+                                let message: JSONValue = .object([
+                                    "role": .string("assistant"), "content": .string(state.text),
+                                    "tool_calls": try JSONValue(toolCalls),
+                                ])
+                                inFlightMessages.append(
+                                    .init(role: .raw(rawContent: message), content: .text(""))
+                                )
+                            }
                         }
+
+                        guard !toolCalls.isEmpty else { break }
+                        try Task.checkCancellation()
+                        try toolRounds.record(toolCalls.map(\.roundCall))
+                        switch try await resolveToolCalls(
+                            toolCalls,
+                            tools: requestContext.tools,
+                            session: session
+                        ) {
+                        case .stop(let calls):
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                            continuation.yield(try state.stoppedSnapshot())
+                            continuation.finish()
+                            return
+                        case .invocations(let invocations):
+                            guard !invocations.isEmpty else {
+                                continuation.finish()
+                                return
+                            }
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                            for invocation in invocations {
+                                state.entries.append(.toolOutput(invocation.output))
+                                inFlightMessages.append(
+                                    .init(
+                                        role: .tool(id: invocation.call.id),
+                                        content: .text(convertSegmentsToToolContentString(invocation.output.segments))
+                                    )
+                                )
+                            }
+                        }
+                        if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                        state.beginNextRound()
                     }
-                    continuation.onTermination = { _ in task.cancel() }
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-
-            return LanguageModelSession.ResponseStream(stream: stream)
+            continuation.onTermination = { _ in task.cancel() }
         }
+        return LanguageModelSession.ResponseStream(stream: stream)
     }
 }
 
@@ -1298,7 +1310,7 @@ private enum Responses {
         let id: String
         let output: [JSONValue]?
         let usage: ResponsesUsage?
-        let error: [JSONValue]?
+        let error: ResponseError?
         let outputText: String?
         let finishReason: String?
 
@@ -1310,6 +1322,12 @@ private enum Responses {
             case finishReason = "finish_reason"
             case error = "error"
         }
+    }
+
+    /// The `error` object of a response, which is `null` unless the response failed.
+    struct ResponseError: Decodable, Sendable {
+        let code: String?
+        let message: String?
     }
 }
 
@@ -1334,6 +1352,9 @@ extension Transcript {
                         content: .blocks(convertSegmentsToOpenAIBlocks(prompt.segments))
                     )
                 )
+            case .reasoning:
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 messages.append(
                     .init(
@@ -1629,9 +1650,8 @@ private struct OpenAIToolFunction: Codable, Sendable {
 
 private enum OpenAIResponsesServerEvent: Decodable, Sendable {
     case outputTextDelta(String)
-    case toolCallCreated(OpenAIToolCall)
-    case toolCallDelta(OpenAIToolCall)
-    case completed(ResponsesUsage?)
+    case completed(Responses.Response?)
+    case failed(ResponseStreamFailure?)
     case ignored
 
     init(from decoder: any Decoder) throws {
@@ -1640,17 +1660,10 @@ private enum OpenAIResponsesServerEvent: Decodable, Sendable {
         switch type {
         case "response.output_text.delta":
             self = .outputTextDelta(try container.decode(String.self, forKey: .delta))
-        case "response.tool_call.created":
-            self = .toolCallCreated(try container.decode(OpenAIToolCall.self, forKey: .toolCall))
-        case "response.tool_call.delta":
-            self = .toolCallDelta(try container.decode(OpenAIToolCall.self, forKey: .toolCall))
         case "response.completed":
-            if container.contains(.response), !(try container.decodeNil(forKey: .response)) {
-                let response = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .response)
-                self = .completed(try response.decodeIfPresent(ResponsesUsage.self, forKey: .usage))
-            } else {
-                self = .completed(nil)
-            }
+            self = .completed(try container.decodeIfPresent(Responses.Response.self, forKey: .response))
+        case "response.failed":
+            self = .failed(ResponseStreamFailure(from: container, forKey: .response))
         default:
             self = .ignored
         }
@@ -1670,6 +1683,12 @@ private struct OpenAIChatCompletionsChunk: Decodable, Sendable {
         struct Delta: Decodable, Sendable {
             let role: String?
             let content: String?
+            let toolCalls: [OpenAIStreamedToolCall.Delta]?
+
+            enum CodingKeys: String, CodingKey {
+                case role, content
+                case toolCalls = "tool_calls"
+            }
         }
         let delta: Delta
         let finishReason: String?
@@ -1685,6 +1704,26 @@ private struct OpenAIChatCompletionsChunk: Decodable, Sendable {
     let usage: ChatCompletionsUsage?
 }
 
+/// Tool arguments arrive in fragments, indexed within the assistant message.
+private struct OpenAIStreamedToolCall {
+    struct Delta: Decodable, Sendable {
+        struct Function: Decodable, Sendable {
+            let name: String?
+            let arguments: String?
+        }
+        let index: Int
+        let id: String?
+        let function: Function?
+    }
+    var id: String?
+    var name = ""
+    var arguments = ""
+
+    var toolCall: OpenAIToolCall {
+        .init(id: id, type: "function", function: .init(name: name, arguments: arguments))
+    }
+}
+
 private struct OpenAIToolInvocationResult {
     let call: Transcript.ToolCall
     let output: Transcript.ToolOutput
@@ -1697,12 +1736,13 @@ private enum OpenAIToolResolutionOutcome {
 
 private func resolveToolCalls(
     _ toolCalls: [OpenAIToolCall],
+    tools: [any Tool],
     session: LanguageModelSession
 ) async throws -> OpenAIToolResolutionOutcome {
     if toolCalls.isEmpty { return .invocations([]) }
 
     var toolsByName: [String: any Tool] = [:]
-    for tool in session.tools {
+    for tool in tools {
         if toolsByName[tool.name] == nil {
             toolsByName[tool.name] = tool
         }
@@ -1986,13 +2026,32 @@ private func extractToolCallsFromOutput(_ output: [JSONValue]?) -> [OpenAIToolCa
 
 // MARK: - Errors
 
-enum OpenAILanguageModelError: LocalizedError {
+/// Errors that can occur when using ``OpenAILanguageModel``.
+///
+/// - Note: This API is exclusive to AnyLanguageModel
+///   and using it means your code is no longer drop-in compatible
+///   with the Foundation Models framework.
+public enum OpenAILanguageModelError: LocalizedError {
+    /// The response contained no output to use.
+    ///
+    /// The Chat Completions API returned no choices,
+    /// or the Responses API returned no JSON for structured output.
     case noResponseGenerated
 
-    var errorDescription: String? {
+    /// The server sent a `response.failed` event
+    /// while streaming from the Responses API.
+    ///
+    /// - Parameters:
+    ///   - code: The error code from the failed response, if the server sent one.
+    ///   - message: The error message from the failed response, if the server sent one.
+    case streamFailed(code: String?, message: String?)
+
+    public var errorDescription: String? {
         switch self {
         case .noResponseGenerated:
             return "No response was generated by the model"
+        case .streamFailed(let code, let message):
+            return streamFailureDescription(code: code, message: message)
         }
     }
 }
@@ -2049,5 +2108,11 @@ private struct ChatCompletionsUsage: Decodable, Sendable {
                 reasoningTokenCount: completionTokensDetails?.reasoningTokens
             )
         ).normalized
+    }
+}
+
+extension OpenAIToolCall {
+    var roundCall: ToolRoundLimit.Call {
+        .init(name: function?.name ?? "", jsonArguments: function?.arguments)
     }
 }

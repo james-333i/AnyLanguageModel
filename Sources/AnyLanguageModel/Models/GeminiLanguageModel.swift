@@ -16,6 +16,9 @@ public struct GeminiLanguageModel: LanguageModel {
 
     /// Custom generation options specific to Gemini models.
     ///
+    /// Reached through `GenerationOptions[custom: GeminiLanguageModel.self]`,
+    /// an AnyLanguageModel extension.
+    ///
     /// Use this type to configure Gemini-specific features like thinking mode
     /// and server-side tools through ``GenerationOptions``.
     ///
@@ -136,14 +139,6 @@ public struct GeminiLanguageModel: LanguageModel {
         }
     }
 
-    /// Deprecated. Use ``CustomGenerationOptions/Thinking`` instead.
-    @available(*, deprecated, renamed: "CustomGenerationOptions.Thinking")
-    public typealias Thinking = CustomGenerationOptions.Thinking
-
-    /// Deprecated. Use ``CustomGenerationOptions/ServerTool`` instead.
-    @available(*, deprecated, renamed: "CustomGenerationOptions.ServerTool")
-    public typealias ServerTool = CustomGenerationOptions.ServerTool
-
     public let baseURL: URL
 
     private let tokenProvider: @Sendable () -> String
@@ -151,40 +146,6 @@ public struct GeminiLanguageModel: LanguageModel {
     public let apiVersion: String
 
     public let model: String
-
-    /// The thinking mode for this model.
-    ///
-    /// - Important: This property is deprecated. Use ``GenerationOptions`` with
-    ///   custom options instead:
-    ///   ```swift
-    ///   var options = GenerationOptions()
-    ///   options[custom: GeminiLanguageModel.self] = .init(thinking: .dynamic)
-    ///   ```
-    @available(*, deprecated, message: "Use GenerationOptions with custom options instead")
-    public var thinking: Thinking {
-        get { _thinking }
-        set { _thinking = newValue }
-    }
-
-    /// Internal storage for the deprecated thinking property.
-    internal var _thinking: CustomGenerationOptions.Thinking
-
-    /// Server-side tools enabled for this model.
-    ///
-    /// - Important: This property is deprecated. Use ``GenerationOptions`` with
-    ///   custom options instead:
-    ///   ```swift
-    ///   var options = GenerationOptions()
-    ///   options[custom: GeminiLanguageModel.self] = .init(serverTools: [.googleSearch])
-    ///   ```
-    @available(*, deprecated, message: "Use GenerationOptions with custom options instead")
-    public var serverTools: [CustomGenerationOptions.ServerTool] {
-        get { _serverTools }
-        set { _serverTools = newValue }
-    }
-
-    /// Internal storage for the deprecated serverTools property.
-    internal var _serverTools: [CustomGenerationOptions.ServerTool]
 
     private let httpSession: HTTPSession
 
@@ -212,50 +173,6 @@ public struct GeminiLanguageModel: LanguageModel {
         self.tokenProvider = tokenProvider
         self.apiVersion = apiVersion
         self.model = model
-        self._thinking = .disabled
-        self._serverTools = []
-        self.httpSession = session
-    }
-
-    /// Creates a new Gemini language model with thinking and server tools configuration.
-    ///
-    /// - Parameters:
-    ///   - baseURL: The base URL for the Gemini API.
-    ///   - tokenProvider: A closure that provides the API key.
-    ///   - apiVersion: The API version to use.
-    ///   - model: The model identifier.
-    ///   - thinking: The thinking mode configuration.
-    ///   - serverTools: Server-side tools to enable.
-    ///   - session: The HTTP session or client used for network requests.
-    ///
-    /// - Important: This initializer is deprecated. Use the initializer without
-    ///   `thinking` and `serverTools` parameters, and pass these options through
-    ///   ``GenerationOptions`` instead.
-    @available(
-        *,
-        deprecated,
-        message: "Use init without thinking/serverTools and pass them via GenerationOptions custom options"
-    )
-    public init(
-        baseURL: URL = defaultBaseURL,
-        apiKey tokenProvider: @escaping @autoclosure @Sendable () -> String,
-        apiVersion: String = defaultAPIVersion,
-        model: String,
-        thinking: CustomGenerationOptions.Thinking = .disabled,
-        serverTools: [CustomGenerationOptions.ServerTool] = [],
-        session: HTTPSession = makeDefaultSession(),
-    ) {
-        var baseURL = baseURL
-        if !baseURL.path.hasSuffix("/") {
-            baseURL = baseURL.appendingPathComponent("")
-        }
-
-        self.baseURL = baseURL
-        self.tokenProvider = tokenProvider
-        self.apiVersion = apiVersion
-        self.model = model
-        self._thinking = thinking
-        self._serverTools = serverTools
         self.httpSession = session
     }
 
@@ -303,8 +220,8 @@ public struct GeminiLanguageModel: LanguageModel {
     ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
         // Extract effective configuration from custom options or fall back to model defaults
         let customOptions = options[custom: GeminiLanguageModel.self]
-        let effectiveThinking = customOptions?.thinking ?? _thinking
-        let effectiveServerTools = customOptions?.serverTools ?? _serverTools
+        let effectiveThinking = customOptions?.thinking ?? .disabled
+        let effectiveServerTools = customOptions?.serverTools ?? []
         let effectiveJsonMode = customOptions?.jsonMode
 
         let url =
@@ -313,19 +230,29 @@ public struct GeminiLanguageModel: LanguageModel {
             .appendingPathComponent("models/\(model):generateContent")
         let headers = buildHeaders()
 
-        let geminiTools = try buildTools(from: session.tools, serverTools: effectiveServerTools)
+        var inFlightEntries: [Transcript.Entry] = []
 
-        var transcript = session.transcript
-
-        // The entries this call adds, which is what the response reports. `transcript` keeps the
-        // full conversation because each iteration rebuilds the request from it.
+        // The entries this call adds, which is what the response reports. `inFlightEntries`
+        // preserves tool rounds while each iteration rebuilds the request from a fresh context.
         var entries: [Transcript.Entry] = []
         var usage = ReportedUsage()
+        // The text of earlier tool rounds, which string responses include.
+        var earlierText = ""
 
+        var toolRounds = ToolRoundLimit(provider: "Gemini")
         // Multi-turn conversation loop for tool calling
         while true {
+            let requestContext = session.resolvedRequestContext()
+            let geminiTools = try buildTools(
+                from: requestContext.tools,
+                serverTools: effectiveServerTools
+            )
+            var requestTranscript = requestContext.transcript
+            for entry in inFlightEntries {
+                requestTranscript.append(entry)
+            }
             let params = try createGenerateContentParams(
-                contents: transcript.toGeminiContent(),
+                contents: requestTranscript.toGeminiContent(),
                 tools: geminiTools,
                 generating: type,
                 schema: schema,
@@ -349,16 +276,24 @@ public struct GeminiLanguageModel: LanguageModel {
                 throw GeminiError.noCandidate
             }
 
-            let providerMetadata = try textPartMetadata(firstCandidate.content.parts ?? [])
             let functionCalls: [GeminiFunctionCall] =
                 firstCandidate.content.parts?.compactMap { part in
                     if case .functionCall(let call) = part { return call }
                     return nil
                 } ?? []
+            let providerMetadata = try textPartMetadata(
+                firstCandidate.content.parts ?? [],
+                includeUnsignedText: !functionCalls.isEmpty
+            )
 
             if !functionCalls.isEmpty {
                 // Resolve function calls
-                let resolution = try await resolveFunctionCalls(functionCalls, session: session)
+                try toolRounds.record(functionCalls.map(\.roundCall))
+                let resolution = try await resolveFunctionCalls(
+                    functionCalls,
+                    tools: requestContext.tools,
+                    session: session
+                )
                 switch resolution {
                 case .stop(let calls):
                     if !calls.isEmpty {
@@ -376,28 +311,24 @@ public struct GeminiLanguageModel: LanguageModel {
                         let calls = Transcript.Entry.toolCalls(
                             Transcript.ToolCalls(invocations.map(\.call), providerMetadata: providerMetadata)
                         )
-                        transcript.append(calls)
+                        inFlightEntries.append(calls)
                         entries.append(calls)
 
                         for invocation in invocations {
                             let output = Transcript.Entry.toolOutput(invocation.output)
-                            transcript.append(output)
+                            inFlightEntries.append(output)
                             entries.append(output)
                         }
                     }
+
+                    if type == String.self { earlierText += textPartsText(firstCandidate.content.parts) }
 
                     // Continue the loop to send the next request with tool results
                     continue
                 }
             } else {
                 // No function calls, extract final text and return
-                let text =
-                    firstCandidate.content.parts?.compactMap { part -> String? in
-                        switch part {
-                        case .text(let t): return t.text
-                        default: return nil
-                        }
-                    }.joined() ?? ""
+                let text = earlierText + textPartsText(firstCandidate.content.parts)
 
                 if type == String.self {
                     return LanguageModelSession.Response(
@@ -466,8 +397,8 @@ public struct GeminiLanguageModel: LanguageModel {
     ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
         // Extract effective configuration from custom options or fall back to model defaults
         let customOptions = options[custom: GeminiLanguageModel.self]
-        let effectiveThinking = customOptions?.thinking ?? _thinking
-        let effectiveServerTools = customOptions?.serverTools ?? _serverTools
+        let effectiveThinking = customOptions?.thinking ?? .disabled
+        let effectiveServerTools = customOptions?.serverTools ?? []
         let effectiveJsonMode = customOptions?.jsonMode
 
         var streamURL =
@@ -482,85 +413,86 @@ public struct GeminiLanguageModel: LanguageModel {
             let task = Task { @Sendable in
                 do {
                     let headers = buildHeaders()
-
-                    let geminiTools = try buildTools(from: session.tools, serverTools: effectiveServerTools)
-
-                    let params = try createGenerateContentParams(
-                        contents: session.transcript.toGeminiContent(),
-                        tools: geminiTools,
-                        generating: type,
-                        schema: schema,
-                        options: options,
-                        thinking: effectiveThinking,
-                        jsonMode: effectiveJsonMode
-                    )
-
-                    let body = try JSONEncoder().encode(params)
-
-                    let stream: AsyncThrowingStream<GeminiGenerateContentResponse, any Error> =
-                        httpSession
-                        .fetchEventStream(
-                            .post,
-                            url: url,
-                            headers: headers,
-                            body: body
+                    var inFlightEntries: [Transcript.Entry] = []
+                    var state = StreamingResponseState<Content>()
+                    var toolRounds = ToolRoundLimit(provider: "Gemini")
+                    while true {
+                        try Task.checkCancellation()
+                        let requestContext = session.resolvedRequestContext()
+                        let geminiTools = try buildTools(
+                            from: requestContext.tools,
+                            serverTools: effectiveServerTools
                         )
-
-                    var accumulatedText = ""
-                    var accumulatedParts: [GeminiPart] = []
-                    var usage = ReportedUsage()
-
-                    func snapshot() throws -> LanguageModelSession.ResponseStream<Content>.Snapshot? {
-                        var raw: GeneratedContent
-                        let content: Content.PartiallyGenerated?
-
-                        if type == String.self {
-                            raw = GeneratedContent(accumulatedText)
-                            content = (accumulatedText as! Content).asPartiallyGenerated()
-                        } else {
-                            raw =
-                                (try? GeneratedContent(json: accumulatedText))
-                                ?? GeneratedContent(accumulatedText)
-                            if let parsed = try? type.init(raw) {
-                                content = parsed.asPartiallyGenerated()
-                            } else {
-                                // Skip invalid partial JSON until it parses cleanly.
-                                content = nil
-                            }
+                        var requestTranscript = requestContext.transcript
+                        for entry in inFlightEntries {
+                            requestTranscript.append(entry)
                         }
-
-                        guard let content else { return nil }
-                        return .init(
-                            content: content,
-                            rawContent: raw,
-                            usage: usage.value,
-                            providerMetadata: try textPartMetadata(accumulatedParts)
+                        let params = try createGenerateContentParams(
+                            contents: requestTranscript.toGeminiContent(),
+                            tools: geminiTools,
+                            generating: type,
+                            schema: schema,
+                            options: options,
+                            thinking: effectiveThinking,
+                            jsonMode: effectiveJsonMode
                         )
-                    }
-
-                    for try await chunk in stream {
-                        let chunkUsage = chunk.usageMetadata?.reportedUsage
-                        usage.merge(chunkUsage)
-
-                        var yieldedText = false
-                        if let parts = chunk.candidates.first?.content.parts {
-                            for part in parts {
-                                if case .text(let textPart) = part {
-                                    accumulatedText += textPart.text
-                                    accumulatedParts.append(part)
-
-                                    if let snapshot = try snapshot() {
+                        let body = try JSONEncoder().encode(params)
+                        let stream: AsyncThrowingStream<GeminiGenerateContentResponse, any Error> =
+                            httpSession.fetchEventStream(.post, url: url, headers: headers, body: body)
+                        var parts: [GeminiPart] = []
+                        var functionCalls: [GeminiFunctionCall] = []
+                        for try await chunk in stream {
+                            state.usage.merge(chunk.usageMetadata?.reportedUsage)
+                            var yieldedText = false
+                            for part in chunk.candidates.first?.content.parts ?? [] {
+                                parts.append(part)
+                                switch part {
+                                case .text(let textPart):
+                                    state.text += textPart.text
+                                    if let snapshot = state.snapshot(providerMetadata: try textPartMetadata(parts)) {
                                         continuation.yield(snapshot)
                                         yieldedText = true
                                     }
+                                case .functionCall(let call):
+                                    functionCalls.append(call)
+                                default:
+                                    break
                                 }
                             }
+                            if chunk.usageMetadata?.reportedUsage != nil, !yieldedText,
+                                let snapshot = state.snapshot(providerMetadata: try textPartMetadata(parts))
+                            {
+                                continuation.yield(snapshot)
+                            }
                         }
-
-                        // A chunk that only reports usage still updates the counts.
-                        if chunkUsage != nil, !yieldedText, let snapshot = try snapshot() {
-                            continuation.yield(snapshot)
+                        guard !functionCalls.isEmpty else { break }
+                        try Task.checkCancellation()
+                        let metadata = try textPartMetadata(parts, includeUnsignedText: true)
+                        try toolRounds.record(functionCalls.map(\.roundCall))
+                        switch try await resolveFunctionCalls(
+                            functionCalls,
+                            tools: requestContext.tools,
+                            session: session
+                        ) {
+                        case .stop(let calls):
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(calls, providerMetadata: metadata)))
+                            continuation.yield(try state.stoppedSnapshot())
+                            continuation.finish()
+                            return
+                        case .invocations(let invocations):
+                            let calls = Transcript.Entry.toolCalls(
+                                Transcript.ToolCalls(invocations.map(\.call), providerMetadata: metadata)
+                            )
+                            inFlightEntries.append(calls)
+                            state.entries.append(calls)
+                            for invocation in invocations {
+                                let output = Transcript.Entry.toolOutput(invocation.output)
+                                inFlightEntries.append(output)
+                                state.entries.append(output)
+                            }
                         }
+                        if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                        state.beginNextRound()
                     }
 
                     continuation.finish()
@@ -702,12 +634,13 @@ private enum ToolResolutionOutcome {
 
 private func resolveFunctionCalls(
     _ functionCalls: [GeminiFunctionCall],
+    tools: [any Tool],
     session: LanguageModelSession
 ) async throws -> ToolResolutionOutcome {
     if functionCalls.isEmpty { return .invocations([]) }
 
     var toolsByName: [String: any Tool] = [:]
-    for tool in session.tools {
+    for tool in tools {
         if toolsByName[tool.name] == nil {
             toolsByName[tool.name] = tool
         }
@@ -716,7 +649,7 @@ private func resolveFunctionCalls(
     var transcriptCalls: [Transcript.ToolCall] = []
     transcriptCalls.reserveCapacity(functionCalls.count)
     for call in functionCalls {
-        let args = try toGeneratedContent(call.args)
+        let args = GeneratedContent(.object(call.args ?? [:]))
         let callID = UUID().uuidString
         transcriptCalls.append(
             Transcript.ToolCall(
@@ -806,6 +739,16 @@ private func resolveFunctionCalls(
     return .invocations(results)
 }
 
+/// Joins the text parts of a Gemini response.
+private func textPartsText(_ parts: [GeminiPart]?) -> String {
+    parts?.compactMap { part -> String? in
+        switch part {
+        case .text(let t): return t.text
+        default: return nil
+        }
+    }.joined() ?? ""
+}
+
 private func emptyResponseContent<Content: Generable>(
     for type: Content.Type
 ) throws -> (content: Content, rawContent: GeneratedContent) {
@@ -823,23 +766,6 @@ private func emptyResponseContent<Content: Generable>(
         let content = try type.init(rawNull)
         return (content, rawNull)
     }
-}
-
-private func toGeneratedContent(_ value: [String: JSONValue]?) throws -> GeneratedContent {
-    guard let value else { return GeneratedContent(properties: [:]) }
-    let data = try JSONEncoder().encode(JSONValue.object(value))
-    let json = String(data: data, encoding: .utf8) ?? "{}"
-    return try GeneratedContent(json: json)
-}
-
-private func fromGeneratedContent(_ content: GeneratedContent) throws -> [String: JSONValue] {
-    let data = Data(content.jsonString.utf8)
-    let jsonValue = try JSONDecoder().decode(JSONValue.self, from: data)
-
-    guard case .object(let dict) = jsonValue else {
-        return [:]
-    }
-    return dict
 }
 
 private func toJSONValue(_ toolOutput: Transcript.ToolOutput) throws -> [String: JSONValue] {
@@ -885,6 +811,9 @@ extension Transcript {
                         parts: convertSegmentsToGeminiParts(prompt.segments)
                     )
                 )
+            case .reasoning:
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 messages.append(
                     .init(
@@ -896,7 +825,7 @@ extension Transcript {
             case .toolCalls(let toolCalls):
                 // Add model's response with function calls
                 let functionCallParts: [GeminiPart] = toolCalls.map { call in
-                    let args = try? fromGeneratedContent(call.arguments)
+                    let args = call.arguments.jsonValue.objectValue ?? [:]
                     return .functionCall(
                         GeminiFunctionCall(
                             name: call.toolName,
@@ -1085,12 +1014,21 @@ private struct GeminiTextHistoryPart: Codable {
 // Keep signed text on its original part,
 // including unsigned siblings and their order relative to function calls.
 // Call arguments remain in the transcript's semantic representation.
-private func textPartMetadata(_ parts: [GeminiPart]) throws -> [String: String]? {
+// Tool-call rounds keep unsigned text too,
+// so the follow-up request replays what the model wrote before its calls.
+private func textPartMetadata(
+    _ parts: [GeminiPart],
+    includeUnsignedText: Bool = false
+) throws -> [String: String]? {
     let textParts = parts.enumerated().compactMap { index, part -> GeminiTextHistoryPart? in
         guard case .text(let text) = part else { return nil }
         return GeminiTextHistoryPart(index: index, part: text)
     }
-    guard textParts.contains(where: { $0.part.thoughtSignature != nil }) else { return nil }
+    guard
+        includeUnsignedText
+            ? !textParts.isEmpty
+            : textParts.contains(where: { $0.part.thoughtSignature != nil })
+    else { return nil }
     let data = try JSONEncoder().encode(textParts)
     return [textPartsMetadataKey: String(decoding: data, as: UTF8.self)]
 }
@@ -1244,5 +1182,11 @@ enum GeminiError: Error, CustomStringConvertible {
         case .noCandidate:
             return "No candidate in response"
         }
+    }
+}
+
+extension GeminiFunctionCall {
+    var roundCall: ToolRoundLimit.Call {
+        .init(name: name, arguments: args)
     }
 }

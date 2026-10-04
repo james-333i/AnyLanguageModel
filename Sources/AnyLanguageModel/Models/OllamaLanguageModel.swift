@@ -20,6 +20,9 @@ public struct OllamaLanguageModel: LanguageModel {
 
     /// Custom generation options specific to Ollama.
     ///
+    /// Reached through `GenerationOptions[custom: OllamaLanguageModel.self]`,
+    /// an AnyLanguageModel extension.
+    ///
     /// Use this type to pass additional model parameters that are not part
     /// of the standard ``GenerationOptions``.
     ///
@@ -116,19 +119,7 @@ public struct OllamaLanguageModel: LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
-        let userSegments = extractPromptSegments(from: session, fallbackText: prompt.description)
-        let (ollamaText, ollamaImages) = convertSegmentsToOllama(userSegments)
-        let messages = [
-            OllamaMessage(
-                role: .user,
-                content: ollamaText,
-                images: ollamaImages.isEmpty ? nil : ollamaImages
-            )
-        ]
         let ollamaOptions = convertOptions(options)
-        let ollamaTools = try session.tools.map { tool in
-            try convertToolToOllamaFormat(tool)
-        }
         let ollamaFormat: JSONValue?
         if type == String.self {
             ollamaFormat = nil
@@ -137,6 +128,12 @@ public struct OllamaLanguageModel: LanguageModel {
             ollamaFormat = try JSONValue(schema)
         }
 
+        let requestContext = session.resolvedRequestContext()
+        let ollamaTools = try requestContext.tools.map(convertToolToOllamaFormat)
+        var messages = try requestContext.transcript.toOllamaMessages()
+        if messages.isEmpty {
+            messages.append(.init(role: .user, content: prompt.description))
+        }
         let params = try createChatParams(
             model: model,
             messages: messages,
@@ -148,7 +145,7 @@ public struct OllamaLanguageModel: LanguageModel {
         )
 
         let url = baseURL.appendingPathComponent("api/chat")
-        let body = try JSONEncoder().encode(params)
+        let body = try encodeChatParams(params)
         let chatResponse: ChatResponse = try await httpSession.fetch(
             .post,
             url: url,
@@ -160,7 +157,11 @@ public struct OllamaLanguageModel: LanguageModel {
         let usage = chatResponse.reportedUsage?.value ?? .zero
 
         if let toolCalls = chatResponse.message.toolCalls, !toolCalls.isEmpty {
-            let resolution = try await resolveToolCalls(toolCalls, session: session)
+            let resolution = try await resolveToolCalls(
+                toolCalls,
+                tools: requestContext.tools,
+                session: session
+            )
             switch resolution {
             case .stop(let calls):
                 if !calls.isEmpty {
@@ -244,102 +245,95 @@ public struct OllamaLanguageModel: LanguageModel {
         includeSchemaInPrompt: Bool,
         options: GenerationOptions
     ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
-        let userSegments = extractPromptSegments(from: session, fallbackText: prompt.description)
-        let (ollamaText, ollamaImages) = convertSegmentsToOllama(userSegments)
-        let messages = [
-            OllamaMessage(
-                role: .user,
-                content: ollamaText,
-                images: ollamaImages.isEmpty ? nil : ollamaImages
-            )
-        ]
-        let ollamaOptions = convertOptions(options)
         let url = baseURL.appendingPathComponent("api/chat")
-
-        // Transform the newline-delimited JSON stream from Ollama into ResponseStream snapshots
-        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> =
-            AsyncThrowingStream { continuation in
+        let stream = AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> {
+            continuation in
+            let task = Task {
                 do {
-                    let ollamaTools = try session.tools.map { tool in
-                        try convertToolToOllamaFormat(tool)
-                    }
-                    let ollamaFormat: JSONValue?
-                    if type == String.self {
-                        ollamaFormat = nil
-                    } else {
-                        let schema = try convertSchemaToOllamaFormat(schema)
-                        ollamaFormat = try JSONValue(schema)
-                    }
-
-                    let params = try createChatParams(
-                        model: model,
-                        messages: messages,
-                        tools: ollamaTools.isEmpty ? nil : ollamaTools,
-                        options: ollamaOptions,
-                        stream: true,
-                        format: ollamaFormat,
-                        parameters: extractTopLevelChatParameters(options)
-                    )
-                    let body = try JSONEncoder().encode(params)
-
-                    let task = Task {
-                        // Reuse ChatResponse as each streamed line shares the same shape
-                        do {
-                            let chunks =
-                                httpSession.fetchStream(
-                                    .post,
-                                    url: url,
-                                    body: body,
-                                    dateDecodingStrategy: .iso8601WithFractionalSeconds
-                                ) as AsyncThrowingStream<ChatResponse, any Error>
-
-                            var partialText = ""
-                            var usage = ReportedUsage()
-
-                            for try await chunk in chunks {
-                                usage.merge(chunk.reportedUsage)
-                                if let piece = chunk.message.content { partialText += piece }
-                                if chunk.message.content != nil || chunk.reportedUsage != nil {
-                                    if type == String.self {
-                                        continuation.yield(
-                                            .init(
-                                                content: (partialText as! Content).asPartiallyGenerated(),
-                                                rawContent: GeneratedContent(partialText),
-                                                usage: usage.value
-                                            )
-                                        )
-                                    } else if let raw = try? GeneratedContent(json: partialText),
-                                        let parsed = try? type.init(raw)
-                                    {
-                                        continuation.yield(
-                                            .init(
-                                                content: parsed.asPartiallyGenerated(),
-                                                rawContent: raw,
-                                                usage: usage.value
-                                            )
-                                        )
-                                    }
-                                }
-
-                                if chunk.done {
-                                    break
-                                }
-                            }
-
-                            continuation.finish()
-                        } catch {
-                            continuation.finish(throwing: error)
+                    let format = type == String.self ? nil : try JSONValue(convertSchemaToOllamaFormat(schema))
+                    var inFlightMessages: [OllamaMessage] = []
+                    var state = StreamingResponseState<Content>()
+                    var toolRounds = ToolRoundLimit(provider: "Ollama")
+                    while true {
+                        try Task.checkCancellation()
+                        let requestContext = session.resolvedRequestContext()
+                        let tools = try requestContext.tools.map(convertToolToOllamaFormat)
+                        var messages = try requestContext.transcript.toOllamaMessages()
+                        if messages.isEmpty {
+                            messages.append(.init(role: .user, content: prompt.description))
                         }
+                        messages.append(contentsOf: inFlightMessages)
+                        let params = try createChatParams(
+                            model: model,
+                            messages: messages,
+                            tools: tools.isEmpty ? nil : tools,
+                            options: convertOptions(options),
+                            stream: true,
+                            format: format,
+                            parameters: extractTopLevelChatParameters(options)
+                        )
+                        let body = try encodeChatParams(params)
+                        let chunks: AsyncThrowingStream<ChatResponse, any Error> = httpSession.fetchStream(
+                            .post,
+                            url: url,
+                            body: body,
+                            dateDecodingStrategy: .iso8601WithFractionalSeconds
+                        )
+                        var toolCalls: [OllamaToolCall] = []
+                        for try await chunk in chunks {
+                            state.usage.merge(chunk.reportedUsage)
+                            if let piece = chunk.message.content { state.text += piece }
+                            toolCalls.append(contentsOf: chunk.message.toolCalls ?? [])
+                            if chunk.message.content != nil || chunk.reportedUsage != nil {
+                                if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                            }
+                            if chunk.done { break }
+                        }
+                        guard !toolCalls.isEmpty else { break }
+                        try Task.checkCancellation()
+                        try toolRounds.record(toolCalls.map(\.roundCall))
+                        switch try await resolveToolCalls(
+                            toolCalls,
+                            tools: requestContext.tools,
+                            session: session
+                        ) {
+                        case .stop(let calls):
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                            continuation.yield(try state.stoppedSnapshot())
+                            continuation.finish()
+                            return
+                        case .invocations(let invocations):
+                            inFlightMessages.append(
+                                .init(
+                                    role: .assistant,
+                                    content: state.text,
+                                    toolCalls: try toolCalls.map { try JSONValue($0) }
+                                )
+                            )
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                            for invocation in invocations {
+                                state.entries.append(.toolOutput(invocation.output))
+                                let (text, images) = convertSegmentsToOllama(invocation.output.segments)
+                                inFlightMessages.append(
+                                    .init(
+                                        role: .tool,
+                                        content: text,
+                                        images: images.isEmpty ? nil : images,
+                                        toolName: invocation.call.toolName
+                                    )
+                                )
+                            }
+                        }
+                        if let snapshot = state.snapshot() { continuation.yield(snapshot) }
+                        state.beginNextRound()
                     }
-
-                    continuation.onTermination = { _ in
-                        task.cancel()
-                    }
+                    continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
-
+            continuation.onTermination = { _ in task.cancel() }
+        }
         return LanguageModelSession.ResponseStream(stream: stream)
     }
 }
@@ -358,6 +352,7 @@ private enum ToolResolutionOutcome {
 
 private func resolveToolCalls(
     _ toolCalls: [OllamaToolCall],
+    tools: [any Tool],
     session: LanguageModelSession
 ) async throws -> ToolResolutionOutcome {
     if toolCalls.isEmpty {
@@ -365,7 +360,7 @@ private func resolveToolCalls(
     }
 
     var toolsByName: [String: any Tool] = [:]
-    for tool in session.tools {
+    for tool in tools {
         if toolsByName[tool.name] == nil {
             toolsByName[tool.name] = tool
         }
@@ -374,7 +369,7 @@ private func resolveToolCalls(
     var transcriptCalls: [Transcript.ToolCall] = []
     transcriptCalls.reserveCapacity(toolCalls.count)
     for call in toolCalls {
-        let args = try toGeneratedContent(call.function.arguments)
+        let args = GeneratedContent(call.function.arguments ?? .object([:]))
         let callID = call.id ?? UUID().uuidString
         transcriptCalls.append(
             Transcript.ToolCall(
@@ -537,15 +532,16 @@ private func convertToolToOllamaFormat(_ tool: any Tool) throws -> [String: JSON
     ]
 }
 
-private func convertSchemaToOllamaFormat(_ schema: GenerationSchema) throws -> JSONSchema {
-    try schema.inlinedJSONSchema()
+private func encodeChatParams(_ params: [String: JSONValue]) throws -> Data {
+    let encoder = JSONEncoder()
+    // Ollama reuses prompt prefixes only when their serialized bytes match.
+    // Dictionary iteration order must not vary between equivalent requests.
+    encoder.outputFormatting = [.sortedKeys]
+    return try encoder.encode(params)
 }
 
-private func toGeneratedContent(_ value: JSONValue?) throws -> GeneratedContent {
-    guard let value else { return GeneratedContent(properties: [:]) }
-    let data = try JSONEncoder().encode(value)
-    let json = String(data: data, encoding: .utf8) ?? "{}"
-    return try GeneratedContent(json: json)
+private func convertSchemaToOllamaFormat(_ schema: GenerationSchema) throws -> JSONSchema {
+    try schema.inlinedJSONSchema()
 }
 
 func createChatParams(
@@ -597,11 +593,74 @@ struct OllamaMessage: Hashable, Codable, Sendable {
     let role: Role
     let content: String
     let images: [String]?
+    let toolCalls: [JSONValue]?
+    let toolName: String?
 
-    init(role: Role, content: String, images: [String]? = nil) {
+    enum CodingKeys: String, CodingKey {
+        case role, content, images
+        case toolCalls = "tool_calls"
+        case toolName = "tool_name"
+    }
+
+    init(
+        role: Role,
+        content: String,
+        images: [String]? = nil,
+        toolCalls: [JSONValue]? = nil,
+        toolName: String? = nil
+    ) {
         self.role = role
         self.content = content
         self.images = images
+        self.toolCalls = toolCalls
+        self.toolName = toolName
+    }
+}
+
+private extension Transcript {
+    func toOllamaMessages() throws -> [OllamaMessage] {
+        try compactMap { entry -> OllamaMessage? in
+            let role: OllamaMessage.Role
+            let segments: [Transcript.Segment]
+            switch entry {
+            case .instructions(let instructions):
+                role = .system
+                segments = instructions.segments
+            case .prompt(let prompt):
+                role = .user
+                segments = prompt.segments
+            case .reasoning:
+                // Keep display history in the transcript without sending unsupported replay state.
+                return nil
+            case .response(let response):
+                role = .assistant
+                segments = response.segments
+            case .toolCalls(let calls):
+                return .init(
+                    role: .assistant,
+                    content: "",
+                    toolCalls: try calls.map { call in
+                        try JSONValue(
+                            OllamaToolCall(
+                                id: call.id,
+                                type: "function",
+                                function: .init(name: call.toolName, arguments: call.arguments.jsonValue)
+                            )
+                        )
+                    }
+                )
+            case .toolOutput(let output):
+                let (text, images) = convertSegmentsToOllama(output.segments)
+                return .init(
+                    role: .tool,
+                    content: text,
+                    images: images.isEmpty ? nil : images,
+                    toolName: output.toolName
+                )
+            }
+            let (text, images) = convertSegmentsToOllama(segments)
+            return .init(role: role, content: text, images: images.isEmpty ? nil : images)
+        }
     }
 }
 
@@ -625,15 +684,6 @@ private func convertSegmentsToOllama(_ segments: [Transcript.Segment]) -> (Strin
         }
     }
     return (textParts.joined(separator: "\n"), images)
-}
-
-private func extractPromptSegments(from session: LanguageModelSession, fallbackText: String) -> [Transcript.Segment] {
-    for entry in session.transcript.reversed() {
-        if case .prompt(let p) = entry {
-            return p.segments
-        }
-    }
-    return [.text(.init(content: fallbackText))]
 }
 
 private struct ChatResponse: Decodable, Sendable {
@@ -673,18 +723,24 @@ private struct ChatMessageResponse: Decodable, Sendable {
     }
 }
 
-private struct OllamaToolCall: Decodable, Sendable {
+private struct OllamaToolCall: Codable, Sendable {
     let id: String?
     let type: String?
     let function: OllamaToolFunction
 }
 
-private struct OllamaToolFunction: Decodable, Sendable {
+private struct OllamaToolFunction: Codable, Sendable {
     let name: String
     let arguments: JSONValue?
 
     private enum CodingKeys: String, CodingKey {
         case name
         case arguments
+    }
+}
+
+extension OllamaToolCall {
+    var roundCall: ToolRoundLimit.Call {
+        .init(name: function.name, arguments: function.arguments)
     }
 }

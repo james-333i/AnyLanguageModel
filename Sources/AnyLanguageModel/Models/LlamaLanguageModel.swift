@@ -25,10 +25,7 @@ import Foundation
     /// Use this model to generate text using GGUF models running directly with llama.cpp.
     ///
     /// ```swift
-    /// let model = LlamaLanguageModel(
-    ///     modelPath: "/path/to/model.gguf",
-    ///     contextSize: 2048
-    /// )
+    /// let model = LlamaLanguageModel(modelPath: "/path/to/model.gguf")
     /// ```
     public final class LlamaLanguageModel: LanguageModel, @unchecked Sendable {
         /// The reason the model is unavailable.
@@ -65,6 +62,9 @@ import Foundation
         }
 
         /// Custom generation options specific to llama.cpp.
+        ///
+        /// Reached through `GenerationOptions[custom: LlamaLanguageModel.self]`,
+        /// an AnyLanguageModel extension.
         ///
         /// Use this type to pass llama.cpp-specific sampling parameters that are
         /// not part of the standard ``GenerationOptions``.
@@ -227,109 +227,8 @@ import Foundation
             #endif
         }
 
-        /// The context size for the model.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(contextSize: 4096)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var contextSize: UInt32 { legacyDefaults.contextSize }
-
-        /// The batch size for processing.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(batchSize: 1024)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var batchSize: UInt32 { legacyDefaults.batchSize }
-
-        /// The number of threads to use.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(threads: 8)
-        ///   ```
-        ///   custom options instead.
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var threads: Int32 { legacyDefaults.threads }
-
-        /// The random seed for generation.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(seed: 42)
-        ///   ```
-        ///   custom options instead.
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var seed: UInt32 { legacyDefaults.seed }
-
-        /// The temperature for sampling.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(temperature: 0.6)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var temperature: Float { legacyDefaults.temperature }
-
-        /// The top-K sampling parameter.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(topK: 25)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var topK: Int32 { legacyDefaults.topK }
-
-        /// The top-P (nucleus) sampling parameter.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(topP: 0.9)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var topP: Float { legacyDefaults.topP }
-
-        /// The repeat penalty for generation.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(repeatPenalty: 1.2)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var repeatPenalty: Float { legacyDefaults.repeatPenalty }
-
-        /// The number of tokens to consider for repeat penalty.
-        ///
-        /// - Important: This property is deprecated.
-        ///   Use ``GenerationOptions`` with custom options instead:
-        ///   ```swift
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(repeatLastN: 128)
-        ///   ```
-        @available(*, deprecated, message: "Use GenerationOptions custom options instead")
-        public var repeatLastN: Int32 { legacyDefaults.repeatLastN }
-
-        /// Normalized legacy defaults used for deprecated properties.
-        private let legacyDefaults: ResolvedGenerationOptions
+        /// The default options that each request's options override.
+        private let defaultOptions: ResolvedGenerationOptions
 
         /// The minimum log level for llama.cpp output.
         ///
@@ -733,43 +632,7 @@ import Foundation
             self.modelPath = modelPath
             self.gpuLayers = gpuLayers
             self.mmprojPath = mmprojPath
-            self.legacyDefaults = ResolvedGenerationOptions()
-        }
-
-        /// Creates a Llama language model using legacy parameter defaults.
-        ///
-        /// - Important: This initializer is deprecated.
-        ///   Use `init(modelPath:)` and configure per-request values via
-        ///   ``GenerationOptions`` custom options instead.
-        ///
-        ///   ```swift
-        ///   let model = LlamaLanguageModel(modelPath: "/path/to/model.gguf")
-        ///   var options = GenerationOptions()
-        ///   options[custom: LlamaLanguageModel.self] = .init(contextSize: 4096)
-        ///
-        ///   let session = LanguageModelSession(model: model)
-        ///   session.respond(to: "Hello, world!", options: options)
-        ///   ```
-        @available(
-            *,
-            deprecated,
-            message: "Use init(modelPath:) and pass values via GenerationOptions custom options"
-        )
-        public convenience init(
-            modelPath: String,
-            contextSize: UInt32 = 2048,
-            batchSize: UInt32 = 512,
-            threads: Int32 = Int32(ProcessInfo.processInfo.processorCount),
-            seed: UInt32 = UInt32.random(in: 0 ... UInt32.max),
-            temperature: Float = 0.8,
-            topK: Int32 = 40,
-            topP: Float = 0.95,
-            repeatPenalty: Float = 1.1,
-            repeatLastN: Int32 = 64
-        ) {
-            // Deprecated: prefer setting these via GenerationOptions custom options.
-            // We intentionally ignore legacy parameters to avoid storing model-level state.
-            self.init(modelPath: modelPath)
+            self.defaultOptions = ResolvedGenerationOptions()
         }
 
         deinit {
@@ -843,9 +706,14 @@ import Foundation
             return LlamaToolCallFormat.detect(template: template)
         }
 
-        private func makeToolPromptContext(for session: LanguageModelSession) throws -> LlamaToolPromptContext? {
-            guard !session.tools.isEmpty, self.model != nil else { return nil }
-            return try LlamaToolPromptContext(format: currentToolCallFormat(), tools: session.tools)
+        private func makeToolPromptContext(
+            tools: [any Tool],
+            pendingEntries: [Transcript.Entry] = []
+        ) throws -> LlamaToolPromptContext? {
+            guard (!tools.isEmpty || !pendingEntries.isEmpty), self.model != nil else { return nil }
+            var context = try LlamaToolPromptContext(format: currentToolCallFormat(), tools: tools)
+            context.pendingEntries = pendingEntries
+            return context
         }
 
         private func makeTranscriptToolCalls(
@@ -862,12 +730,13 @@ import Foundation
 
         private func resolveToolCalls(
             _ parsedCalls: [LlamaParsedToolCall],
+            tools: [any Tool],
             session: LanguageModelSession
         ) async throws -> ToolResolutionOutcome {
             if parsedCalls.isEmpty { return .invocations([]) }
 
             var toolsByName: [String: any Tool] = [:]
-            for tool in session.tools where toolsByName[tool.name] == nil {
+            for tool in tools where toolsByName[tool.name] == nil {
                 toolsByName[tool.name] = tool
             }
 
@@ -989,9 +858,6 @@ import Foundation
             includeSchemaInPrompt: Bool,
             options: GenerationOptions
         ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
-            if mmprojPath == nil {
-                try validateNoImageSegments(in: session)
-            }
             try ensureModelLoaded()
 
             let runtimeOptions = resolvedOptions(from: options)
@@ -1002,18 +868,26 @@ import Foundation
             if type == String.self {
                 let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
                 let outputFormat = currentToolCallFormat()
-                var toolContext = try makeToolPromptContext(for: session)
                 let maxToolIterations = 8
                 var toolIteration = 0
                 var previousToolCallSignature: String?
                 var allEntries: [Transcript.Entry] = []
                 var text = ""
                 var usage = LanguageModelSession.Usage.zero
+                var pendingEntries: [Transcript.Entry] = []
 
                 generationLoop: while true {
+                    let requestContext = session.resolvedRequestContext()
+                    if mmprojPath == nil {
+                        try validateNoImageSegments(in: requestContext.transcript)
+                    }
+                    let toolContext = try makeToolPromptContext(
+                        tools: requestContext.tools,
+                        pendingEntries: pendingEntries
+                    )
                     var promptImages: [Data] = []
                     let fullPrompt = try formatPrompt(
-                        for: session,
+                        requestContext: requestContext,
                         extraSystemMessage: nil,
                         assistantPrefill: runtimeOptions.assistantPrefill,
                         imageMarker: imageMarker,
@@ -1091,7 +965,11 @@ import Foundation
                     }
                     previousToolCallSignature = signature
 
-                    let resolution = try await resolveToolCalls(parsedCalls, session: session)
+                    let resolution = try await resolveToolCalls(
+                        parsedCalls,
+                        tools: requestContext.tools,
+                        session: session
+                    )
                     switch resolution {
                     case .stop(let calls):
                         if !calls.isEmpty {
@@ -1111,11 +989,11 @@ import Foundation
                             Transcript.ToolCalls(invocations.map(\.call))
                         )
                         allEntries.append(callsEntry)
-                        toolContext?.pendingEntries.append(callsEntry)
+                        pendingEntries.append(callsEntry)
                         for invocation in invocations {
                             let outputEntry = Transcript.Entry.toolOutput(invocation.output)
                             allEntries.append(outputEntry)
-                            toolContext?.pendingEntries.append(outputEntry)
+                            pendingEntries.append(outputEntry)
                         }
                     }
                 }
@@ -1127,11 +1005,15 @@ import Foundation
                     usage: usage
                 )
             } else {
+                let requestContext = session.resolvedRequestContext()
+                if mmprojPath == nil {
+                    try validateNoImageSegments(in: requestContext.transcript)
+                }
                 var promptImages: [Data] = []
                 let fullPrompt: String
                 if includeSchemaInPrompt {
                     fullPrompt = try formatPrompt(
-                        for: session,
+                        requestContext: requestContext,
                         extraSystemMessage: schemaPrompt(for: schema),
                         assistantPrefill: runtimeOptions.assistantPrefill,
                         imageMarker: imageMarker,
@@ -1139,7 +1021,7 @@ import Foundation
                     )
                 } else {
                     fullPrompt = try formatPrompt(
-                        for: session,
+                        requestContext: requestContext,
                         extraSystemMessage: nil,
                         assistantPrefill: runtimeOptions.assistantPrefill,
                         imageMarker: imageMarker,
@@ -1227,18 +1109,6 @@ import Foundation
                 }
             }
 
-            if mmprojPath == nil {
-                do {
-                    try validateNoImageSegments(in: session)
-                } catch {
-                    return LanguageModelSession.ResponseStream(
-                        stream: AsyncThrowingStream { continuation in
-                            continuation.finish(throwing: error)
-                        }
-                    )
-                }
-            }
-
             let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> =
                 AsyncThrowingStream { continuation in
                     let task = Task {
@@ -1248,7 +1118,6 @@ import Foundation
                             let runtimeOptions = resolvedOptions(from: options)
                             let maxTokens = runtimeOptions.maximumResponseTokens ?? 100
                             let outputFormat = self.currentToolCallFormat()
-                            var toolContext = try self.makeToolPromptContext(for: session)
                             let maxToolIterations = 8
                             var toolIteration = 0
                             var previousToolCallSignature: String?
@@ -1256,6 +1125,7 @@ import Foundation
                             var emittedBase = ""
                             var usage = LanguageModelSession.Usage.zero
                             var lastYieldedText: String?
+                            var pendingEntries: [Transcript.Entry] = []
                             let imageMarker =
                                 self.mtmdContext != nil ? String(cString: mtmd_default_marker()) : nil
 
@@ -1271,9 +1141,17 @@ import Foundation
                             }
 
                             generationLoop: while true {
+                                let requestContext = session.resolvedRequestContext()
+                                if self.mmprojPath == nil {
+                                    try self.validateNoImageSegments(in: requestContext.transcript)
+                                }
+                                let toolContext = try self.makeToolPromptContext(
+                                    tools: requestContext.tools,
+                                    pendingEntries: pendingEntries
+                                )
                                 var promptImages: [Data] = []
                                 let fullPrompt = try self.formatPrompt(
-                                    for: session,
+                                    requestContext: requestContext,
                                     extraSystemMessage: nil,
                                     assistantPrefill: runtimeOptions.assistantPrefill,
                                     imageMarker: imageMarker,
@@ -1366,7 +1244,11 @@ import Foundation
                                 }
                                 previousToolCallSignature = signature
 
-                                let resolution = try await self.resolveToolCalls(parsedCalls, session: session)
+                                let resolution = try await self.resolveToolCalls(
+                                    parsedCalls,
+                                    tools: requestContext.tools,
+                                    session: session
+                                )
                                 switch resolution {
                                 case .stop(let calls):
                                     emittedBase += roundVisible
@@ -1384,11 +1266,11 @@ import Foundation
                                         Transcript.ToolCalls(invocations.map(\.call))
                                     )
                                     accumulatedEntries.append(callsEntry)
-                                    toolContext?.pendingEntries.append(callsEntry)
+                                    pendingEntries.append(callsEntry)
                                     for invocation in invocations {
                                         let outputEntry = Transcript.Entry.toolOutput(invocation.output)
                                         accumulatedEntries.append(outputEntry)
-                                        toolContext?.pendingEntries.append(outputEntry)
+                                        pendingEntries.append(outputEntry)
                                     }
                                     emittedBase += roundVisible
                                     yieldSnapshot(emittedBase)
@@ -1455,7 +1337,7 @@ import Foundation
                 var mtmdParams = mtmd_context_params_default()
                 mtmdParams.use_gpu = gpuLayers != 0
                 mtmdParams.print_timings = false
-                mtmdParams.n_threads = legacyDefaults.threads
+                mtmdParams.n_threads = defaultOptions.threads
                 guard let projector = mtmd_init_from_file(mmprojPath, loadedModel, mtmdParams) else {
                     llama_model_free(loadedModel)
                     throw LlamaLanguageModelError.modelLoadFailed
@@ -1479,7 +1361,7 @@ import Foundation
         }
 
         private func resolvedOptions(from options: GenerationOptions) -> ResolvedGenerationOptions {
-            var base = legacyDefaults
+            var base = defaultOptions
             if let temp = options.temperature {
                 base.temperature = Float(temp)
             }
@@ -1494,7 +1376,7 @@ import Foundation
 
         /// Builds structured-generation defaults while honoring explicit overrides.
         private func resolvedStructuredOptions(from options: GenerationOptions) -> ResolvedGenerationOptions {
-            var base = legacyDefaults
+            var base = defaultOptions
             if let temp = options.temperature {
                 base.temperature = Float(temp)
             } else {
@@ -2133,9 +2015,9 @@ import Foundation
 
         // MARK: - Image Validation
 
-        private func validateNoImageSegments(in session: LanguageModelSession) throws {
+        private func validateNoImageSegments(in transcript: Transcript) throws {
             // Check for image segments in the most recent prompt from the transcript
-            for entry in session.transcript.reversed() {
+            for entry in transcript.reversed() {
                 if case .prompt(let p) = entry {
                     for segment in p.segments {
                         if case .image = segment {
@@ -2268,14 +2150,14 @@ import Foundation
         }
 
         private func formatPrompt(
-            for session: LanguageModelSession,
+            requestContext: LanguageModelSession.RequestContext,
             extraSystemMessage: String? = nil,
             assistantPrefill: String? = nil,
             toolContext: LlamaToolPromptContext? = nil
         ) throws -> String {
             var images: [Data] = []
             return try formatPrompt(
-                for: session,
+                requestContext: requestContext,
                 extraSystemMessage: extraSystemMessage,
                 assistantPrefill: assistantPrefill,
                 imageMarker: nil,
@@ -2285,7 +2167,7 @@ import Foundation
         }
 
         private func formatPrompt(
-            for session: LanguageModelSession,
+            requestContext: LanguageModelSession.RequestContext,
             extraSystemMessage: String?,
             assistantPrefill: String?,
             imageMarker: String?,
@@ -2320,6 +2202,9 @@ import Foundation
                         messages.append(("user", text))
                     }
 
+                case .reasoning:
+                    // Keep display history in the transcript without sending unsupported replay state.
+                    return
                 case .response(let response):
                     let text = try extractContent(
                         from: response.segments,
@@ -2359,7 +2244,7 @@ import Foundation
                 }
             }
 
-            for entry in session.transcript {
+            for entry in requestContext.transcript {
                 try appendEntry(entry)
             }
             if let toolContext {
@@ -2602,6 +2487,10 @@ import Foundation
     }
 
     /// Errors that can occur when using LlamaLanguageModel
+    ///
+    /// - Note: This API is exclusive to AnyLanguageModel
+    ///   and using it means your code is no longer drop-in compatible
+    ///   with the Foundation Models framework.
     public enum LlamaLanguageModelError: Error, LocalizedError {
         case modelLoadFailed
         case contextInitializationFailed

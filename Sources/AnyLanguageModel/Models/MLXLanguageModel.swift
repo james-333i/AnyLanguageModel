@@ -201,8 +201,9 @@ import Foundation
 
         /// Configures MLX-specific generation behavior.
         ///
-        /// Set these values through ``GenerationOptions`` using
-        /// `GenerationOptions[custom: MLXLanguageModel.self]`.
+        /// Set these values through
+        /// `GenerationOptions[custom: MLXLanguageModel.self]`,
+        /// an AnyLanguageModel extension.
         public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions, Codable {
             /// Configures KV-cache behavior for MLX generation.
             public struct KVCache: Codable, Equatable, Sendable {
@@ -453,14 +454,18 @@ import Foundation
             let prefillTokenCount: Int
             let prefixTokens: [Int32]
             let cacheConfigSignature: CacheConfigSignature
+            /// Model state that continuing this cache requires, such as M-RoPE position deltas.
+            let state: MLXLMCommon.LMOutput.State?
 
             init(
                 kvCache: [MLXLMCommon.KVCache],
                 prefillTokenCount: Int,
                 prefixTokens: [Int32],
-                cacheConfigSignature: CacheConfigSignature
+                cacheConfigSignature: CacheConfigSignature,
+                state: MLXLMCommon.LMOutput.State?
             ) {
                 self.kvCache = kvCache
+                self.state = state
                 self.prefillTokenCount = prefillTokenCount
                 self.prefixTokens = prefixTokens
                 self.cacheConfigSignature = cacheConfigSignature
@@ -836,20 +841,45 @@ import Foundation
             input.text.tokens.asArray(Int32.self)
         }
 
-        /// Returns the prefix that can actually be reused, or zero for a cache miss.
+        /// Returns the number of cached tokens that can be reused, or zero for a cache miss.
+        ///
+        /// This is the longest common prefix of the cached and current tokens,
+        /// leaving at least one current token to evaluate.
+        /// Reusing less than the whole cache requires trimming it, so `canTrim` must be true.
+        ///
+        /// A cache whose offset no longer matches the stored prefix was changed
+        /// by a request that ended before storing it, such as a cancelled stream.
         internal static func reusablePrefixTokenCount(
             prefixTokens: [Int32],
             prefillTokenCount: Int,
+            cacheOffset: Int,
             currentTokens: [Int32],
             configurationMatches: Bool,
-            hasMedia: Bool
+            hasMedia: Bool,
+            canTrim: Bool
         ) -> Int {
             guard !hasMedia, configurationMatches,
-                prefillTokenCount > 0, currentTokens.count > prefillTokenCount,
-                prefixTokens.count == prefillTokenCount,
-                currentTokens.starts(with: prefixTokens)
+                prefillTokenCount > 0, cacheOffset == prefillTokenCount,
+                prefixTokens.count == prefillTokenCount
             else { return 0 }
-            return prefillTokenCount
+            let commonCount = zip(prefixTokens, currentTokens).prefix { $0 == $1 }.count
+            let reusableCount = min(commonCount, currentTokens.count - 1)
+            guard reusableCount > 0, reusableCount == prefillTokenCount || canTrim else { return 0 }
+            return reusableCount
+        }
+
+        /// Returns the tokens and mask that follow a cached prefix of `count` tokens.
+        ///
+        /// Tokens are rank 1 from text-only processors and `[1, length]` from some VLM processors,
+        /// so this slices the last axis.
+        internal static func droppingCachedPrefix(
+            of text: MLXLMCommon.LMInput.Text,
+            count: Int
+        ) -> MLXLMCommon.LMInput.Text {
+            MLXLMCommon.LMInput.Text(
+                tokens: text.tokens[.ellipsis, count...],
+                mask: text.mask?[.ellipsis, count...]
+            )
         }
 
         private func resolveCache(
@@ -857,7 +887,10 @@ import Foundation
             lmInput: MLXLMCommon.LMInput,
             generateParameters: MLXLMCommon.GenerateParameters,
             context: ModelContext
-        ) -> (cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32], cachedTokenCount: Int) {
+        ) throws -> (
+            cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32], cachedTokenCount: Int,
+            state: MLXLMCommon.LMOutput.State?
+        ) {
             let signature = cacheSignature(from: generateParameters)
             let fullTokens = tokens(from: lmInput)
             let existingEntry = getSessionCache(for: session)
@@ -867,32 +900,119 @@ import Foundation
                     Self.reusablePrefixTokenCount(
                         prefixTokens: entry.prefixTokens,
                         prefillTokenCount: entry.prefillTokenCount,
+                        cacheOffset: entry.kvCache.first?.offset ?? 0,
                         currentTokens: fullTokens,
                         configurationMatches: entry.cacheConfigSignature == signature,
-                        hasMedia: lmInput.image != nil || lmInput.video != nil
+                        hasMedia: lmInput.image != nil || lmInput.video != nil,
+                        canTrim: MLXLMCommon.canTrimPromptCache(entry.kvCache)
                     )
                 } ?? 0
             if let existingEntry, cachedCount > 0 {
-                let newTokens = lmInput.text.tokens[cachedCount...]
-                let newMask = lmInput.text.mask?[cachedCount...]
-                let partialText = MLXLMCommon.LMInput.Text(tokens: newTokens, mask: newMask)
-                return (existingEntry.kvCache, MLXLMCommon.LMInput(text: partialText), fullTokens, cachedCount)
+                if cachedCount < existingEntry.prefillTokenCount {
+                    MLXLMCommon.trimPromptCache(
+                        existingEntry.kvCache,
+                        numTokens: existingEntry.prefillTokenCount - cachedCount
+                    )
+                }
+                let partialText = Self.droppingCachedPrefix(of: lmInput.text, count: cachedCount)
+                return (
+                    existingEntry.kvCache, MLXLMCommon.LMInput(text: partialText), fullTokens, cachedCount,
+                    existingEntry.state
+                )
             }
 
             if existingEntry != nil {
                 removeSessionCache(for: session)
             }
 
-            let newCache = context.model.newCache(parameters: generateParameters)
-            return (newCache, lmInput, fullTokens, 0)
+            let newCache = try context.model.newCache(parameters: generateParameters)
+            return (newCache, lmInput, fullTokens, 0, nil)
+        }
+
+        /// Starts generation, reusing the session's cache when it can.
+        ///
+        /// Some models, such as Qwen3-VL, need model state along with a reused cache.
+        /// The session cache keeps the state from the request that filled it.
+        /// If a model still throws `ContinuationStateError`,
+        /// drop the session cache and start from an empty one.
+        private func startGeneration(
+            session: LanguageModelSession,
+            lmInput: MLXLMCommon.LMInput,
+            generateParameters: MLXLMCommon.GenerateParameters,
+            context: ModelContext
+        ) throws -> (
+            stream: AsyncStream<MLXLMCommon.Generation>, cache: [MLXLMCommon.KVCache], fullTokens: [Int32],
+            cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+        ) {
+            func start(
+                _ resolved: (
+                    cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32],
+                    cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+                )
+            ) throws -> (
+                stream: AsyncStream<MLXLMCommon.Generation>, cache: [MLXLMCommon.KVCache], fullTokens: [Int32],
+                cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+            ) {
+                // Creating the iterator evaluates the prompt.
+                // Its state then anchors the next request that reuses this cache.
+                let iterator = try MLXLMCommon.TokenIterator(
+                    input: resolved.input,
+                    model: context.model,
+                    cache: resolved.cache,
+                    state: resolved.state,
+                    parameters: generateParameters
+                )
+                let state = iterator.state
+                let (stream, _) = MLXLMCommon.generateTask(
+                    promptTokenCount: resolved.input.text.tokens.size,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator,
+                    toolCallPolicy: generateParameters.toolCallPolicy
+                )
+                return (stream, resolved.cache, resolved.fullTokens, resolved.cachedTokenCount, state)
+            }
+
+            let resolved = try resolveCache(
+                session: session,
+                lmInput: lmInput,
+                generateParameters: generateParameters,
+                context: context
+            )
+            do {
+                return try start(resolved)
+            } catch is MLXLMCommon.ContinuationStateError where resolved.cachedTokenCount > 0 {
+                removeSessionCache(for: session)
+                return try start(
+                    resolveCache(
+                        session: session,
+                        lmInput: lmInput,
+                        generateParameters: generateParameters,
+                        context: context
+                    )
+                )
+            }
         }
 
         private func storeSessionCache(
             cache: [MLXLMCommon.KVCache],
             fullTokens: [Int32],
+            state: MLXLMCommon.LMOutput.State?,
             generateParameters: MLXLMCommon.GenerateParameters,
             session: LanguageModelSession
         ) {
+            // After generation, the cache also holds the response tokens.
+            // The next prompt encodes the response again through the chat template,
+            // so keep only the prompt, or drop the entry if the cache can't be trimmed.
+            let generatedCount = (cache.first?.offset ?? 0) - fullTokens.count
+            if generatedCount > 0 {
+                guard MLXLMCommon.canTrimPromptCache(cache) else {
+                    removeSessionCache(for: session)
+                    return
+                }
+                MLXLMCommon.trimPromptCache(cache, numTokens: generatedCount)
+            }
+
             let offset = cache.first?.offset ?? 0
             let prefillCount = max(0, min(offset, fullTokens.count))
             guard prefillCount > 0 else {
@@ -905,7 +1025,8 @@ import Foundation
                 kvCache: cache,
                 prefillTokenCount: prefillCount,
                 prefixTokens: prefixTokens,
-                cacheConfigSignature: cacheSignature(from: generateParameters)
+                cacheConfigSignature: cacheSignature(from: generateParameters),
+                state: state
             )
             setSessionCache(entry, for: session)
         }
@@ -918,8 +1039,8 @@ import Foundation
             GPUMemoryManager.shared.markIdle(scope: id)
         }
 
-        private func mlxToolSpecs(for session: LanguageModelSession) -> [ToolSpec]? {
-            session.tools.isEmpty ? nil : session.tools.map { convertToolToMLXSpec($0) }
+        private func mlxToolSpecs(for tools: [any Tool]) -> [ToolSpec]? {
+            tools.isEmpty ? nil : tools.map { convertToolToMLXSpec($0) }
         }
 
         private func makeUserInput(
@@ -991,10 +1112,11 @@ import Foundation
             defer { endGenerationScope(generationScope) }
 
             if type != String.self {
+                let requestContext = session.resolvedRequestContext()
                 let (jsonString, usage) = try await generateStructuredJSON(
                     context: context,
                     tokenCache: loaded.tokenCache,
-                    session: session,
+                    requestContext: requestContext,
                     prompt: prompt,
                     schema: schema,
                     options: options,
@@ -1010,8 +1132,6 @@ import Foundation
                 )
             }
 
-            let toolSpecs = mlxToolSpecs(for: session)
-
             // Map AnyLanguageModel GenerationOptions to MLX GenerateParameters
             let generateParameters = toGenerateParameters(options)
 
@@ -1021,8 +1141,7 @@ import Foundation
                 options[custom: MLXLanguageModel.self]?.processingForUserInput
                 ?? .init(resize: nil)
 
-            // Build chat history from full transcript
-            var chat = convertTranscriptToMLXChat(session: session, fallbackPrompt: prompt.description)
+            var pendingChat: [MLXLMCommon.Chat.Message] = []
 
             var usage = LanguageModelSession.Usage.zero
             var allTextChunks: [String] = []
@@ -1033,6 +1152,13 @@ import Foundation
 
             // Loop until no more tool calls
             while true {
+                let requestContext = session.resolvedRequestContext()
+                let toolSpecs = mlxToolSpecs(for: requestContext.tools)
+                let chat =
+                    convertTranscriptToMLXChat(
+                        requestContext: requestContext,
+                        fallbackPrompt: prompt.description
+                    ) + pendingChat
                 // Build user input with current chat history and tools
                 let userInput = makeUserInput(
                     chat: chat,
@@ -1041,23 +1167,18 @@ import Foundation
                     additionalContext: additionalContext
                 )
                 let lmInput = try await context.processor.prepare(input: userInput)
-                let resolved = resolveCache(
+                // Generate
+                let resolved = try startGeneration(
                     session: session,
                     lmInput: lmInput,
                     generateParameters: generateParameters,
                     context: context
                 )
-
-                // Generate
-                let stream = try MLXLMCommon.generate(
-                    input: resolved.input,
-                    cache: resolved.cache,
-                    parameters: generateParameters,
-                    context: context
-                )
+                let stream = resolved.stream
 
                 var chunks: [String] = []
                 var collectedToolCalls: [MLXLMCommon.ToolCall] = []
+                var rejectedToolCall: MLXLMCommon.RejectedToolCall?
 
                 for await item in stream {
                     switch item {
@@ -1073,11 +1194,18 @@ import Foundation
                         )
                     case .toolCall(let call):
                         collectedToolCalls.append(call)
+                    case .rejectedToolCall(let rejection):
+                        rejectedToolCall = rejectedToolCall ?? rejection
                     }
+                }
+                if let rejectedToolCall {
+                    removeSessionCache(for: session)
+                    throw MLXLMCommon.RejectedToolCallError(rejectedToolCall)
                 }
                 storeSessionCache(
                     cache: resolved.cache,
                     fullTokens: resolved.fullTokens,
+                    state: resolved.state,
                     generateParameters: generateParameters,
                     session: session
                 )
@@ -1087,7 +1215,7 @@ import Foundation
 
                 // Add assistant response to chat history
                 if !assistantText.isEmpty {
-                    chat.append(.assistant(assistantText))
+                    pendingChat.append(.assistant(assistantText))
                 }
 
                 // If there are tool calls, execute them and continue
@@ -1110,7 +1238,11 @@ import Foundation
                     }
                     previousToolCallSignature = signature
 
-                    let resolution = try await resolveToolCalls(collectedToolCalls, session: session)
+                    let resolution = try await resolveToolCalls(
+                        collectedToolCalls,
+                        tools: requestContext.tools,
+                        session: session
+                    )
                     switch resolution {
                     case .stop(let calls):
                         if !calls.isEmpty {
@@ -1132,7 +1264,7 @@ import Foundation
 
                                 // Convert tool output to JSON string for MLX
                                 let toolResultJSON = toolOutputToJSON(invocation.output)
-                                chat.append(.tool(toolResultJSON))
+                                pendingChat.append(.tool(toolResultJSON))
                             }
 
                             // Continue loop to generate with tool results
@@ -1259,11 +1391,7 @@ import Foundation
                         let userInputProcessing =
                             options[custom: MLXLanguageModel.self]?.processingForUserInput
                             ?? .init(resize: nil)
-                        let toolSpecs = mlxToolSpecs(for: session)
-                        var chat = convertTranscriptToMLXChat(
-                            session: session,
-                            fallbackPrompt: prompt.description
-                        )
+                        var pendingChat: [MLXLMCommon.Chat.Message] = []
 
                         // Accumulators live outside the tool loop so streamed snapshots stay
                         // monotonic across rounds: text never shrinks, entries only grow.
@@ -1291,6 +1419,13 @@ import Foundation
 
                         // Loop until the model stops without pending tool calls (mirrors `respond()`).
                         toolLoop: while true {
+                            let requestContext = session.resolvedRequestContext()
+                            let toolSpecs = mlxToolSpecs(for: requestContext.tools)
+                            let chat =
+                                convertTranscriptToMLXChat(
+                                    requestContext: requestContext,
+                                    fallbackPrompt: prompt.description
+                                ) + pendingChat
                             let userInput = makeUserInput(
                                 chat: chat,
                                 tools: toolSpecs,
@@ -1298,22 +1433,17 @@ import Foundation
                                 additionalContext: additionalContext
                             )
                             let lmInput = try await context.processor.prepare(input: userInput)
-                            let resolved = resolveCache(
+                            let resolved = try startGeneration(
                                 session: session,
                                 lmInput: lmInput,
                                 generateParameters: generateParameters,
                                 context: context
                             )
-
-                            let mlxStream = try MLXLMCommon.generate(
-                                input: resolved.input,
-                                cache: resolved.cache,
-                                parameters: generateParameters,
-                                context: context
-                            )
+                            let mlxStream = resolved.stream
 
                             let roundStartTextCount = accumulatedText.count
                             var collectedToolCalls: [MLXLMCommon.ToolCall] = []
+                            var rejectedToolCall: MLXLMCommon.RejectedToolCall?
 
                             for await item in mlxStream {
                                 if Task.isCancelled { break toolLoop }
@@ -1324,6 +1454,8 @@ import Foundation
                                     yieldSnapshot()
                                 case .toolCall(let call):
                                     collectedToolCalls.append(call)
+                                case .rejectedToolCall(let rejection):
+                                    rejectedToolCall = rejectedToolCall ?? rejection
                                 case .info(let info):
                                     usage.add(
                                         LocalGenerationUsage(
@@ -1335,10 +1467,15 @@ import Foundation
                                     yieldSnapshot()
                                 }
                             }
+                            if let rejectedToolCall {
+                                removeSessionCache(for: session)
+                                throw MLXLMCommon.RejectedToolCallError(rejectedToolCall)
+                            }
 
                             storeSessionCache(
                                 cache: resolved.cache,
                                 fullTokens: resolved.fullTokens,
+                                state: resolved.state,
                                 generateParameters: generateParameters,
                                 session: session
                             )
@@ -1346,7 +1483,7 @@ import Foundation
                             // Feed this round's assistant text back into the chat history.
                             let roundText = String(accumulatedText.dropFirst(roundStartTextCount))
                             if !roundText.isEmpty {
-                                chat.append(.assistant(roundText))
+                                pendingChat.append(.assistant(roundText))
                             }
 
                             guard !collectedToolCalls.isEmpty else { break }
@@ -1365,7 +1502,11 @@ import Foundation
                             }
                             previousToolCallSignature = signature
 
-                            let resolution = try await resolveToolCalls(collectedToolCalls, session: session)
+                            let resolution = try await resolveToolCalls(
+                                collectedToolCalls,
+                                tools: requestContext.tools,
+                                session: session
+                            )
                             switch resolution {
                             case .stop(let calls):
                                 if !calls.isEmpty {
@@ -1381,7 +1522,7 @@ import Foundation
                                 )
                                 for invocation in invocations {
                                     accumulatedEntries.append(.toolOutput(invocation.output))
-                                    chat.append(.tool(toolOutputToJSON(invocation.output)))
+                                    pendingChat.append(.tool(toolOutputToJSON(invocation.output)))
                                 }
                                 yieldSnapshot()
                             }
@@ -1421,47 +1562,72 @@ import Foundation
             for session: LanguageModelSession,
             promptPrefix: Prompt?
         ) {
+            Task {
+                await prewarmSessionCache(for: session)
+            }
+        }
+
+        /// Fills the session cache with the session's instructions.
+        internal func prewarmSessionCache(for session: LanguageModelSession) async {
             let modelId = self.modelId
             let hub = self.hub
             let directory = self.directory
 
-            Task {
-                guard Self.acquireGenerationSlot(for: session) else {
+            guard Self.acquireGenerationSlot(for: session) else {
+                return
+            }
+            defer { Self.releaseGenerationSlot(for: session) }
+
+            let generationScope = beginGenerationScope()
+            defer { endGenerationScope(generationScope) }
+
+            do {
+                let loaded = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                defer { withExtendedLifetime(loaded) {} }
+                let context = loaded.context
+                let requestContext = session.resolvedRequestContext()
+                guard let instructions = requestContext.instructions?.description, !instructions.isEmpty else {
                     return
                 }
-                defer { Self.releaseGenerationSlot(for: session) }
 
-                let generationScope = beginGenerationScope()
-                defer { endGenerationScope(generationScope) }
+                let toolSpecs = mlxToolSpecs(for: requestContext.tools)
 
-                do {
-                    let loaded = try await loadContext(modelId: modelId, hub: hub, directory: directory)
-                    defer { withExtendedLifetime(loaded) {} }
-                    let context = loaded.context
-                    guard let instructions = session.instructions?.description, !instructions.isEmpty else {
-                        return
+                let params = toGenerateParameters(.init())
+                let newCache = try context.model.newCache(parameters: params)
+                let userInput = MLXLMCommon.UserInput(
+                    chat: [.init(role: .system, content: instructions)],
+                    processing: .init(resize: nil),
+                    tools: toolSpecs
+                )
+                let lmInput = try await context.processor.prepare(input: userInput)
+                let prepareResult = try context.model.prepare(
+                    lmInput,
+                    cache: newCache,
+                    state: nil,
+                    prefill: params.prefill
+                )
+                // `prepare` can leave the last chunk for the first decoding step;
+                // evaluate it so that the cache holds every token.
+                var state: MLXLMCommon.LMOutput.State?
+                switch prepareResult {
+                case .logits(let output):
+                    state = output.state
+                case .tokens(let remaining):
+                    if remaining.tokens.size > 0 {
+                        let output = context.model(remaining[text: .newAxis], cache: newCache, state: nil)
+                        eval(newCache)
+                        state = output.state
                     }
-
-                    let toolSpecs = mlxToolSpecs(for: session)
-
-                    let params = toGenerateParameters(.init())
-                    let newCache = context.model.newCache(parameters: params)
-                    let userInput = MLXLMCommon.UserInput(
-                        chat: [.init(role: .system, content: instructions)],
-                        processing: .init(resize: nil),
-                        tools: toolSpecs
-                    )
-                    let lmInput = try await context.processor.prepare(input: userInput)
-                    _ = try context.model.prepare(lmInput, cache: newCache, windowSize: params.prefillStepSize)
-                    storeSessionCache(
-                        cache: newCache,
-                        fullTokens: tokens(from: lmInput),
-                        generateParameters: params,
-                        session: session
-                    )
-                } catch {
-                    // Ignore errors during prewarm
                 }
+                storeSessionCache(
+                    cache: newCache,
+                    fullTokens: tokens(from: lmInput),
+                    state: state,
+                    generateParameters: params,
+                    session: session
+                )
+            } catch {
+                // Ignore errors during prewarm
             }
         }
     }
@@ -1533,27 +1699,27 @@ import Foundation
     // MARK: - Transcript Conversion
 
     private func convertTranscriptToMLXChat(
-        session: LanguageModelSession,
+        requestContext: LanguageModelSession.RequestContext,
         fallbackPrompt: String
     ) -> [MLXLMCommon.Chat.Message] {
         var chat: [MLXLMCommon.Chat.Message] = []
 
         // Check if instructions are already in transcript
-        let hasInstructionsInTranscript = session.transcript.contains {
+        let hasInstructionsInTranscript = requestContext.transcript.contains {
             if case .instructions = $0 { return true }
             return false
         }
 
         // Add instructions from session if present and not in transcript
         if !hasInstructionsInTranscript,
-            let instructions = session.instructions?.description,
+            let instructions = requestContext.instructions?.description,
             !instructions.isEmpty
         {
             chat.append(.init(role: .system, content: instructions))
         }
 
         // Convert each transcript entry
-        for entry in session.transcript {
+        for entry in requestContext.transcript {
             switch entry {
             case .instructions(let instr):
                 chat.append(makeMLXChatMessage(from: instr.segments, role: .system))
@@ -1561,6 +1727,9 @@ import Foundation
             case .prompt(let prompt):
                 chat.append(makeMLXChatMessage(from: prompt.segments, role: .user))
 
+            case .reasoning:
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
             case .response(let response):
                 let content = response.segments.map { extractText(from: $0) }.joined(separator: "\n")
                 chat.append(.assistant(content))
@@ -1742,12 +1911,13 @@ import Foundation
 
     private func resolveToolCalls(
         _ toolCalls: [MLXLMCommon.ToolCall],
+        tools: [any Tool],
         session: LanguageModelSession
     ) async throws -> ToolResolutionOutcome {
         if toolCalls.isEmpty { return .invocations([]) }
 
         var toolsByName: [String: any Tool] = [:]
-        for tool in session.tools {
+        for tool in tools {
             if toolsByName[tool.name] == nil {
                 toolsByName[tool.name] = tool
             }
@@ -1892,6 +2062,10 @@ import Foundation
     // MARK: - Structured JSON Generation
 
     /// Errors that can occur when using MLXLanguageModel.
+    ///
+    /// - Note: This API is exclusive to AnyLanguageModel
+    ///   and using it means your code is no longer drop-in compatible
+    ///   with the Foundation Models framework.
     public enum MLXLanguageModelError: Error, LocalizedError {
         case invalidVocabSize
         case unsupportedJSONValueType
@@ -1909,7 +2083,7 @@ import Foundation
     private func generateStructuredJSON(
         context: ModelContext,
         tokenCache: StructuredGenerationTokenCache,
-        session: LanguageModelSession,
+        requestContext: LanguageModelSession.RequestContext,
         prompt: Prompt,
         schema: GenerationSchema,
         options: GenerationOptions,
@@ -1918,7 +2092,10 @@ import Foundation
         let maxTokens = options.maximumResponseTokens ?? 512
         let generateParameters = toStructuredGenerateParameters(options)
 
-        let baseChat = convertTranscriptToMLXChat(session: session, fallbackPrompt: prompt.description)
+        let baseChat = convertTranscriptToMLXChat(
+            requestContext: requestContext,
+            fallbackPrompt: prompt.description
+        )
         let schemaPrompt = includeSchemaInPrompt ? schemaPrompt(for: schema) : nil
         let chat = normalizeChatForStructuredGeneration(baseChat, schemaPrompt: schemaPrompt)
 
@@ -1947,7 +2124,7 @@ import Foundation
         let json = try await generator.generate()
         // Ensure pending MLX operations complete before returning JSON.
         // This synchronization can be a performance cost if called frequently.
-        Stream().synchronize()
+        Stream.gpu.synchronize()
         return (
             json,
             LocalGenerationUsage(
@@ -2034,7 +2211,7 @@ import Foundation
             self.model = context.model
             self.tokenizer = context.tokenizer
             self.state = nil
-            self.cache = context.model.newCache(parameters: parameters)
+            self.cache = try context.model.newCache(parameters: parameters)
             self.processor = parameters.processor()
             self.sampler = parameters.sampler()
             self.remainingTokens = maximumTokens
@@ -2062,7 +2239,8 @@ import Foundation
             let prepareResult = try context.model.prepare(
                 input,
                 cache: cache,
-                windowSize: parameters.prefillStepSize
+                state: nil,
+                prefill: parameters.prefill
             )
 
             let output: MLXLMCommon.LMOutput
